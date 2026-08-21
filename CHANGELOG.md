@@ -22,8 +22,9 @@ snapshots live in `versions/`, and promoted revisions receive signed-off Git tag
 Strict versions reject every documented broadcast marker. Duration is used only
 for the independent short-video rule.
 
-- `v5-strict-ingestion.gs` — planned fail-closed candidate classification and
-  non-mutating replay/audit tooling.
+- `v5-strict-ingestion.gs` — fail-closed candidate classification, pre/post
+  insertion revalidation with reserved rollback capacity, and non-mutating
+  replay/target-audit tooling. Live validation is pending.
 - `v6-strict-repair.gs` — planned target-playlist revalidation and repair after
   the v5 dry-run evidence is reviewed.
 
