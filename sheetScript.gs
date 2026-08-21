@@ -15,16 +15,10 @@
 var maxPlaylistWriteOperationsPerRun = 150;
 var playlistWriteOperationsUsed = 0;
 
-// Livestream filtering policy used when column F is blank.
-//   strict: keep upcoming items, remove active broadcasts and every completed
-//           live-like item. This guarantees that archived livestreams such as
-//           a 1h56 stream are rejected, but may also reject a Premiere first
-//           discovered after it has completed because the public API exposes
-//           no reliable completed-stream-versus-Premiere discriminator.
-//   long:   legacy behavior; remove active broadcasts and completed live-like
-//           items only when their duration/live window is over two hours.
-//   off:    do not apply a livestream filter.
-var defaultLivestreamFilterMode = "strict";
+// Default completed-livestream duration cutoff when column F is blank.
+// The unit is hours, so 2 means 2:00:00. Column F can override this per row
+// with decimal hours (for example 1.5) or a duration (for example 02:30:00).
+var defaultLivestreamDurationCutoffHours = 2;
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -48,7 +42,7 @@ var reservedColumnTimestamp = 1;    // Column containing last timestamp
 var reservedColumnFrequency = 2;    // Column containing number of hours until new check
 var reservedColumnDeleteDays = 3;   // Column containing number of days before today until videos get deleted
 var reservedColumnShortsFilter = 4; // Column containing switch for using shorts filter
-var reservedColumnLongVideosFilter = 5; // Livestream mode: Strict, Long, or Off (blank uses the default above)
+var reservedColumnLivestreamDurationCutoff = 5; // Completed-livestream cutoff: hours or HH:MM[:SS]
 // Reserved lengths
 var reservedDebugNumRows = 900;   // Number of rows to use in a column before moving on to the next column in debug sheet
 var reservedDebugNumColumns = 26; // Number of columns to use in debug sheet, must be at least 4 to allow infinite cycle
@@ -794,23 +788,17 @@ function deletePlaylistItems(playlistId, deleteBeforeTimestamp) {
 //
 
 function applyFilters(videoIds, sheet, iRow) {
+  if (!videoIds || videoIds.length == 0) return videoIds || [];
+
   var shortsSetting = normalizeCellValue(
     sheet.getRange(iRow + 1, reservedColumnShortsFilter + 1).getValue()
   ).toLowerCase();
   var filterShorts = shortsSetting == "no";
-  var livestreamFilterMode = getLivestreamFilterMode(sheet, iRow);
-  var filterLivestreams = livestreamFilterMode != "off";
-  if (!filterShorts && !filterLivestreams) return videoIds;
+  var livestreamCutoffSeconds = getLivestreamDurationCutoffSeconds(sheet, iRow);
 
   if (filterShorts) Logger.log("Removing shorts");
-  if (filterLivestreams) {
-    Logger.log("Livestream filter mode: " + livestreamFilterMode.toUpperCase());
-    if (livestreamFilterMode == "strict") {
-      Logger.log("Removing active and completed live-like videos; preserving upcoming items");
-    } else {
-      Logger.log("Removing active livestreams and live-like videos over 2 hours");
-    }
-  }
+  Logger.log("Completed-livestream duration cutoff: " + formatDurationSeconds(livestreamCutoffSeconds));
+  Logger.log("Removing active livestreams and completed live-like videos over the cutoff; preserving upcoming items");
 
   var filteredVideoIds = [];
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -818,8 +806,7 @@ function applyFilters(videoIds, sheet, iRow) {
     try {
       // videos.list accepts up to 50 comma-separated IDs, so both filters share
       // one metadata request instead of making one or two requests per video.
-      var part = filterLivestreams ? 'snippet,contentDetails,liveStreamingDetails' : 'contentDetails';
-      var response = YouTube.Videos.list(part, {id: batch.join(',')});
+      var response = YouTube.Videos.list('snippet,contentDetails,liveStreamingDetails', {id: batch.join(',')});
       if (!response || !response.items) {
         recordRowError("filter", "Video metadata returned an invalid response for a batch of " + batch.length + " videos");
         continue;
@@ -848,8 +835,8 @@ function applyFilters(videoIds, sheet, iRow) {
           Logger.log("Filtered short: " + videoId + " | duration: " + duration);
           keep = false;
         }
-        if (keep && filterLivestreams) {
-          keep = passesLiveLikeFilter(videoId, item, livestreamFilterMode);
+        if (keep) {
+          keep = passesLiveLikeFilter(videoId, item, livestreamCutoffSeconds);
         }
         if (keep) filteredVideoIds.push(videoId);
       });
@@ -866,43 +853,77 @@ function applyFilters(videoIds, sheet, iRow) {
   return filteredVideoIds;
 }
 
-// Column F accepts Strict/No/All, Long/Legacy/2h, or Off/Yes/Keep.
-// Blank cells use defaultLivestreamFilterMode so an older sheet that lacks the
-// newer column cannot silently disable livestream filtering.
-function getLivestreamFilterMode(sheet, iRow) {
-  var rawSetting = normalizeCellValue(
-    sheet.getRange(iRow + 1, reservedColumnLongVideosFilter + 1).getValue()
-  );
-  var parsedMode = parseLivestreamFilterMode(rawSetting);
-  if (parsedMode) return parsedMode;
+// Column F is the per-row completed-livestream cutoff. It accepts decimal
+// hours (2, 1.5) or a displayed duration (02:30 or 02:30:00). A blank cell
+// uses defaultLivestreamDurationCutoffHours. Invalid values are blocking
+// filter errors so the row checkpoint is retained and the configuration can
+// be corrected without silently losing candidates.
+function getLivestreamDurationCutoffSeconds(sheet, iRow) {
+  var range = sheet.getRange(iRow + 1, reservedColumnLivestreamDurationCutoff + 1);
+  var rawValue = range.getValue();
+  var displayValue = typeof range.getDisplayValue == "function" ? range.getDisplayValue() : "";
+  var rawText = normalizeCellValue(rawValue);
+  var displayText = normalizeCellValue(displayValue);
 
-  var fallbackMode = parseLivestreamFilterMode(defaultLivestreamFilterMode) || "strict";
-  if (rawSetting) {
-    recordRowWarning(
-      "filter",
-      "Unknown livestream filter setting '" + rawSetting + "' in column F; using " + fallbackMode.toUpperCase()
-    );
-  }
-  return fallbackMode;
+  if (!rawText && !displayText) return getDefaultLivestreamDurationCutoffSeconds();
+
+  var parsedSeconds = parseLivestreamDurationCutoffSeconds(rawValue, displayValue);
+  if (parsedSeconds !== null) return parsedSeconds;
+
+  recordRowError(
+    "filter",
+    "Invalid livestream duration cutoff in column F: '" + (displayText || rawText) +
+    "'. Enter hours such as 2 or 1.5, or a duration such as 02:30:00. " +
+    "Using the default for this retry."
+  );
+  return getDefaultLivestreamDurationCutoffSeconds();
 }
 
-function parseLivestreamFilterMode(value) {
-  var setting = normalizeCellValue(value).toLowerCase();
-  if (!setting) return null;
+function getDefaultLivestreamDurationCutoffSeconds() {
+  var hours = Number(defaultLivestreamDurationCutoffHours);
+  if (!isFinite(hours) || hours < 0) hours = 2;
+  return Math.round(hours * 60 * 60);
+}
 
-  if (setting == "strict" || setting == "no" || setting == "all" ||
-      setting == "all live" || setting == "all livestreams" || setting == "no livestreams") {
-    return "strict";
+function parseLivestreamDurationCutoffSeconds(rawValue, displayValue) {
+  var displayText = normalizeCellValue(displayValue);
+  if (displayText.indexOf(":") != -1) {
+    return parseClockDurationSeconds(displayText);
   }
-  if (setting == "long" || setting == "legacy" || setting == "2h" ||
-      setting == "over 2h" || setting == "over 2 hours") {
-    return "long";
+
+  if (typeof rawValue == "number") {
+    if (!isFinite(rawValue) || rawValue < 0) return null;
+    return Math.round(rawValue * 60 * 60);
   }
-  if (setting == "off" || setting == "yes" || setting == "keep" ||
-      setting == "none" || setting == "disabled") {
-    return "off";
-  }
-  return null;
+
+  var rawText = normalizeCellValue(rawValue);
+  if (rawText.indexOf(":") != -1) return parseClockDurationSeconds(rawText);
+  if (!rawText && !displayText) return getDefaultLivestreamDurationCutoffSeconds();
+
+  var numericText = rawText || displayText;
+  if (!/^\d+(?:[.,]\d+)?$/.test(numericText)) return null;
+  var hours = Number(numericText.replace(",", "."));
+  return isFinite(hours) && hours >= 0 ? Math.round(hours * 60 * 60) : null;
+}
+
+function parseClockDurationSeconds(value) {
+  var parts = normalizeCellValue(value).split(":");
+  if (parts.length != 2 && parts.length != 3) return null;
+  if (!parts.every(function(part) { return /^\d+$/.test(part); })) return null;
+
+  var hours = Number(parts[0]);
+  var minutes = Number(parts[1]);
+  var seconds = parts.length == 3 ? Number(parts[2]) : 0;
+  if (minutes > 59 || seconds > 59) return null;
+  return hours * 60 * 60 + minutes * 60 + seconds;
+}
+
+function formatDurationSeconds(totalSeconds) {
+  totalSeconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  var hours = Math.floor(totalSeconds / 3600);
+  var minutes = Math.floor((totalSeconds % 3600) / 60);
+  var seconds = totalSeconds % 60;
+  return hours + ":" + (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
 }
 
 // Checks if an ISO 8601 duration is less or equal than three minutes.
@@ -918,14 +939,12 @@ function isLessThanThreeMinutes(duration) {
   return duration.match("^PT([12]M|[1-5]?[0-9]S){1,2}$") != null;
 }
 
-// Applies the selected policy to videos that the public API marks as live-like.
+// Applies the duration cutoff to videos that the public API marks as live-like.
 // The API does not expose a reliable discriminator between a completed stream
-// and a completed Premiere, so Strict and Long intentionally represent two
-// different policy tradeoffs rather than pretending that distinction exists.
-function passesLiveLikeFilter(videoId, item, livestreamFilterMode) {
+// and a completed Premiere. Upcoming items are therefore preserved, while a
+// completed live-like item is judged by its observed duration/live window.
+function passesLiveLikeFilter(videoId, item, livestreamCutoffSeconds) {
   if (!isLiveLikeVideo(item)) return true;
-  livestreamFilterMode = parseLivestreamFilterMode(livestreamFilterMode) ||
-    parseLivestreamFilterMode(defaultLivestreamFilterMode) || "strict";
 
   var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
   if (liveBroadcastContent == "upcoming") {
@@ -939,28 +958,38 @@ function passesLiveLikeFilter(videoId, item, livestreamFilterMode) {
   }
 
   var duration = item.contentDetails && item.contentDetails.duration;
-  if (livestreamFilterMode == "strict") {
-    Logger.log(
-      "Filtered completed live-like video in STRICT mode: " + videoId +
-      (duration ? " | duration: " + duration : "")
+  var durationSeconds = duration ? isoDurationToSeconds(duration) : null;
+  var liveWindowSeconds = getLiveWindowSeconds(item.liveStreamingDetails, liveBroadcastContent);
+  var observedSeconds = null;
+  if (durationSeconds !== null && durationSeconds > 0) observedSeconds = durationSeconds;
+  if (liveWindowSeconds !== null && liveWindowSeconds > 0 &&
+      (observedSeconds === null || liveWindowSeconds > observedSeconds)) {
+    observedSeconds = liveWindowSeconds;
+  }
+
+  if (observedSeconds === null) {
+    recordRowError(
+      "filter",
+      "Cannot determine completed live-like duration for " + videoId + "; withholding it and retaining the row checkpoint for retry"
     );
     return false;
   }
 
-  if (duration && isOverTwoHours(duration)) {
-    Logger.log("Filtered live-like video over 2 hours: " + videoId + " | duration: " + duration);
-    return false;
-  }
-
-  var liveWindowSeconds = getLiveWindowSeconds(item.liveStreamingDetails, liveBroadcastContent);
-  if (liveWindowSeconds !== null && liveWindowSeconds > 2 * 60 * 60) {
-    Logger.log("Filtered live-like video with a live window over 2 hours: " + videoId + " | live window seconds: " + liveWindowSeconds);
+  if (observedSeconds > livestreamCutoffSeconds) {
+    Logger.log(
+      "Filtered completed live-like video over cutoff: " + videoId +
+      " | observed: " + formatDurationSeconds(observedSeconds) +
+      " | cutoff: " + formatDurationSeconds(livestreamCutoffSeconds) +
+      (duration ? " | content duration: " + duration : "") +
+      (liveWindowSeconds !== null ? " | live window seconds: " + liveWindowSeconds : "")
+    );
     return false;
   }
 
   Logger.log(
-    "Kept completed live-like video under the two-hour LONG threshold: " + videoId +
-    (duration ? " | duration: " + duration : "")
+    "Kept completed live-like video at or below cutoff: " + videoId +
+    " | observed: " + formatDurationSeconds(observedSeconds) +
+    " | cutoff: " + formatDurationSeconds(livestreamCutoffSeconds)
   );
   return true;
 }
@@ -991,13 +1020,6 @@ function getLiveWindowSeconds(liveStreamingDetails, liveBroadcastContent) {
 
   var seconds = Math.floor((end.getTime() - start.getTime()) / 1000);
   return seconds >= 0 ? seconds : null;
-}
-
-// Checks if an ISO 8601 duration is strictly longer than two hours.
-// Exactly 2:00:00 is allowed. Change > to >= if you also want to block exactly two-hour videos.
-function isOverTwoHours(duration) {
-  var seconds = isoDurationToSeconds(duration);
-  return seconds !== null && seconds > 2 * 60 * 60;
 }
 
 // Converts Youtube ISO 8601 durations like PT1H23M45S, PT3M, PT2H, or P0D into seconds.

@@ -1,58 +1,52 @@
-# Version 3: livestream filtering correction
+# Version 4: per-row livestream duration cutoff
 
-## Why the shown stream was added
+## Why the 2:33:33 and 3:33:15 streams were added
 
-Two independent conditions allowed it through:
+The previous reliability-fixed script still treated column F as an exact switch:
 
-1. The script only enabled its livestream filter when the row's column F value was exactly `No`. In the supplied screenshot F4 is blank, so the entire live-metadata path was disabled. The `<--` header in F3 has no effect; the code reads F4.
-2. Even with the old filter enabled, its documented policy was to reject active broadcasts and completed live-like videos only when they exceeded two hours. The shown archive is `1:56:07`, so the old `passesLiveLikeFilter()` deliberately returned `true`.
+```js
+var filterLongLiveLike = F4 == "No";
+```
 
-The video is already in the playlist. Replacing the script prevents matching future insertions but does not retroactively delete existing playlist items; remove that item manually once.
+In the supplied sheet, F4 is blank. Therefore `filterLongLiveLike` was false. Since E4 is `No`, the shared filtering function still ran, but it requested only `contentDetails`; it did not request `snippet` or `liveStreamingDetails`, and it never called the live-like filter. The two videos were longer than the shorts threshold, so they survived. Their being 2.5 or 3.5 hours long made no difference because the duration cutoff branch was completely disabled.
 
-## Version 3 behavior
+## Column F behavior
 
-Column F is now an explicit policy rather than a fragile exact-value switch:
+Column F now directly holds the cutoff for completed live-like videos:
 
-| F value | Mode | Behavior |
-|---|---|---|
-| Blank, `Strict`, `No`, `All` | Strict | Preserve `upcoming`; remove active and every completed live-like video, regardless of duration |
-| `Long`, `Legacy`, `2h` | Long | Preserve `upcoming`; remove active live broadcasts and completed live-like videos over two hours |
-| `Off`, `Yes`, `Keep` | Off | Disable livestream filtering |
+- `2` means two hours.
+- `1.5` means one hour and thirty minutes.
+- `02:30` or `02:30:00` means two hours and thirty minutes.
+- A blank cell safely defaults to two hours.
+- `0` rejects every completed live-like item with a positive observed duration.
 
-Blank defaults to `Strict`, so the current sheet works without adding a new column value. The Debug log now prints the selected mode and a reason whenever it filters or retains a live-like item.
+Only completed live-like videos strictly over the cutoff are removed. A video exactly equal to the cutoff is kept. Active livestreams are always removed. Upcoming items are always preserved so scheduled Premieres are not blanket-blocked.
 
-Short-filter parsing is also case-insensitive and whitespace-safe.
+Old keywords such as `Strict`, `Long`, `Off`, `Yes`, or `No` are no longer accepted in column F. An invalid F value creates a blocking filter error, uses the two-hour fallback for that execution, and withholds the row timestamp so the configuration can be corrected without silently losing retry candidates.
 
-## Premiere limitation
+For a Google Sheets duration cell, the code reads the displayed `HH:MM[:SS]` value instead of mistakenly treating the underlying day fraction as hours.
 
-The public `videos.list` resource provides:
+## Filtering details
 
-- `snippet.liveBroadcastContent`: only current `upcoming`, `live`, or `none` state.
-- `liveStreamingDetails`: present for upcoming, active, and completed broadcasts.
+The script always requests `snippet,contentDetails,liveStreamingDetails` in one `videos.list` call for each batch of up to 50 IDs. It identifies completed live-like items through `liveStreamingDetails`, because `snippet.liveBroadcastContent` changes to `none` after completion.
 
-It does not provide a reliable public field that distinguishes a completed livestream from a completed Premiere. Therefore:
+For a completed live-like video, the cutoff uses the greater of:
 
-- `Strict` solves the shown archived-stream problem, but can also reject a Premiere first discovered after it completed.
-- `Long` is the more Premiere-friendly heuristic, but necessarily keeps short archived streams such as the shown `1:56:07` example.
-- `upcoming` remains preserved in both modes, matching the earlier requirement not to blanket-block scheduled Premieres.
+- the encoded `contentDetails.duration`; and
+- the `actualStartTime` to `actualEndTime` live window.
 
-The implementation intentionally avoids scraping YouTube's rendered `Streamed`/`Premiered` label because that is undocumented, locale-dependent, and liable to break.
+This prevents a stream from slipping through when one duration field is slightly shorter or stale. If YouTube marks an item as completed/live-like but supplies no usable duration yet, the video is withheld and the timestamp is retained for retry instead of letting it through.
+
+The public API still does not expose a reliable completed-livestream-versus-completed-Premiere discriminator. A completed Premiere longer than the selected cutoff can therefore also be removed. Upcoming items remain preserved.
+
+Replacing the code does not delete streams already present in a playlist; remove the shown existing entries manually.
 
 Official references:
 
 - [YouTube video resource](https://developers.google.com/youtube/v3/docs/videos)
 - [Videos: list](https://developers.google.com/youtube/v3/docs/videos/list)
 - [LiveBroadcasts resource](https://developers.google.com/youtube/v3/live/docs/liveBroadcasts)
-- [LiveBroadcasts: list](https://developers.google.com/youtube/v3/live/docs/liveBroadcasts/list)
 
 ## Verification
 
-JavaScript syntax validation and eleven regression tests pass. New coverage verifies that:
-
-- blank F defaults to Strict;
-- a completed `PT1H56M7S` broadcast is rejected in Strict mode;
-- that same broadcast is retained in Long mode, documenting the legacy behavior;
-- Off mode makes no metadata request;
-- upcoming items remain eligible;
-- fifty videos still share one batched metadata request;
-- all prior source-error, timestamp, write-budget, and deletion tests continue to pass.
+Fourteen regression tests pass. They cover the shown 2:33:33 and 3:33:15 archives, blank/default and numeric cutoffs, Google Sheets duration values, upcoming items, active streams, exact-cutoff behavior, long normal uploads, unresolved live metadata, one metadata request per 50 IDs, source/read isolation, timestamp safety, write-budget safety, and deletion pagination.
