@@ -230,6 +230,79 @@ function testFilterMetadataIsBatchedAndUpcomingIsKept() {
   assert.ok(!result.includes('video-3'));
 }
 
+function testBlankLivestreamSettingDefaultsToStrictAndRejectsShortArchive() {
+  let requestedPart = '';
+  const ctx = makeContext({
+    Videos: {
+      list(part) {
+        requestedPart = part;
+        return {items: [{
+          id: 'dashpum-stream',
+          snippet: {liveBroadcastContent: 'none'},
+          contentDetails: {duration: 'PT1H56M7S'},
+          liveStreamingDetails: {
+            actualStartTime: '2026-08-03T18:00:00Z',
+            actualEndTime: '2026-08-03T19:56:07Z'
+          }
+        }]};
+      }
+    }
+  });
+  const sheet = {
+    getRange(row, column) {
+      return {getValue: () => (column === 5 ? 'Yes' : '')};
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  const result = Array.from(ctx.applyFilters(['dashpum-stream'], sheet, 3));
+
+  assert.deepStrictEqual(result, []);
+  assert.ok(requestedPart.includes('liveStreamingDetails'));
+  assert.ok(ctx.__logs.some(line => line.includes('Livestream filter mode: STRICT')));
+  assert.ok(ctx.__logs.some(line => line.includes('PT1H56M7S')));
+}
+
+function testLongModeDocumentsAndKeepsShortCompletedLiveLikeVideo() {
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [{
+          id: 'short-archive',
+          snippet: {liveBroadcastContent: 'none'},
+          contentDetails: {duration: 'PT1H56M7S'},
+          liveStreamingDetails: {
+            actualStartTime: '2026-08-03T18:00:00Z',
+            actualEndTime: '2026-08-03T19:56:07Z'
+          }
+        }]};
+      }
+    }
+  });
+  const sheet = {
+    getRange(row, column) {
+      return {getValue: () => (column === 5 ? 'Yes' : 'Long')};
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  const result = Array.from(ctx.applyFilters(['short-archive'], sheet, 3));
+
+  assert.deepStrictEqual(result, ['short-archive']);
+  assert.ok(ctx.__logs.some(line => line.includes('under the two-hour LONG threshold')));
+}
+
+function testOffModeAvoidsMetadataRequest() {
+  const ctx = makeContext({
+    Videos: {list() { throw new Error('videos.list must not be called'); }}
+  });
+  const sheet = {
+    getRange(row, column) {
+      return {getValue: () => (column === 5 ? 'Yes' : 'Off')};
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  assert.deepStrictEqual(Array.from(ctx.applyFilters(['normal-video'], sheet, 3)), ['normal-video']);
+}
+
 function testFilterBatchFailureDoesNotCancelLaterBatch() {
   const ids = Array.from({length: 100}, (_, i) => 'video-' + i);
   let call = 0;
@@ -312,6 +385,9 @@ const tests = [
   testTransientSourceErrorStillBlocksCheckpoint,
   testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
   testFilterMetadataIsBatchedAndUpcomingIsKept,
+  testBlankLivestreamSettingDefaultsToStrictAndRejectsShortArchive,
+  testLongModeDocumentsAndKeepsShortCompletedLiveLikeVideo,
+  testOffModeAvoidsMetadataRequest,
   testFilterBatchFailureDoesNotCancelLaterBatch,
   testWriteBudgetRefusesPartialRow,
   testDeletionReadsAllPagesBeforeMutation
