@@ -1,4 +1,4 @@
-// Reliability-fixed version: 2026-07-21
+// Reliability-fixed version: 2026-08-04
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // Permanent missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -14,6 +14,17 @@
 // of remaining daily quota; it is a conservative circuit breaker.
 var maxPlaylistWriteOperationsPerRun = 150;
 var playlistWriteOperationsUsed = 0;
+
+// Livestream filtering policy used when column F is blank.
+//   strict: keep upcoming items, remove active broadcasts and every completed
+//           live-like item. This guarantees that archived livestreams such as
+//           a 1h56 stream are rejected, but may also reject a Premiere first
+//           discovered after it has completed because the public API exposes
+//           no reliable completed-stream-versus-Premiere discriminator.
+//   long:   legacy behavior; remove active broadcasts and completed live-like
+//           items only when their duration/live window is over two hours.
+//   off:    do not apply a livestream filter.
+var defaultLivestreamFilterMode = "strict";
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -37,7 +48,7 @@ var reservedColumnTimestamp = 1;    // Column containing last timestamp
 var reservedColumnFrequency = 2;    // Column containing number of hours until new check
 var reservedColumnDeleteDays = 3;   // Column containing number of days before today until videos get deleted
 var reservedColumnShortsFilter = 4; // Column containing switch for using shorts filter
-var reservedColumnLongVideosFilter = 5; // Column containing switch for filtering out livestreams/premieres over 2 hours
+var reservedColumnLongVideosFilter = 5; // Livestream mode: Strict, Long, or Off (blank uses the default above)
 // Reserved lengths
 var reservedDebugNumRows = 900;   // Number of rows to use in a column before moving on to the next column in debug sheet
 var reservedDebugNumColumns = 26; // Number of columns to use in debug sheet, must be at least 4 to allow infinite cycle
@@ -783,13 +794,22 @@ function deletePlaylistItems(playlistId, deleteBeforeTimestamp) {
 //
 
 function applyFilters(videoIds, sheet, iRow) {
-  var filterShorts = sheet.getRange(iRow + 1, reservedColumnShortsFilter + 1).getValue() == "No";
-  var filterLongLiveLike = sheet.getRange(iRow + 1, reservedColumnLongVideosFilter + 1).getValue() == "No";
-  if (!filterShorts && !filterLongLiveLike) return videoIds;
+  var shortsSetting = normalizeCellValue(
+    sheet.getRange(iRow + 1, reservedColumnShortsFilter + 1).getValue()
+  ).toLowerCase();
+  var filterShorts = shortsSetting == "no";
+  var livestreamFilterMode = getLivestreamFilterMode(sheet, iRow);
+  var filterLivestreams = livestreamFilterMode != "off";
+  if (!filterShorts && !filterLivestreams) return videoIds;
 
   if (filterShorts) Logger.log("Removing shorts");
-  if (filterLongLiveLike) {
-    Logger.log("Removing active livestreams and livestreams/premieres over 2 hours");
+  if (filterLivestreams) {
+    Logger.log("Livestream filter mode: " + livestreamFilterMode.toUpperCase());
+    if (livestreamFilterMode == "strict") {
+      Logger.log("Removing active and completed live-like videos; preserving upcoming items");
+    } else {
+      Logger.log("Removing active livestreams and live-like videos over 2 hours");
+    }
   }
 
   var filteredVideoIds = [];
@@ -798,7 +818,7 @@ function applyFilters(videoIds, sheet, iRow) {
     try {
       // videos.list accepts up to 50 comma-separated IDs, so both filters share
       // one metadata request instead of making one or two requests per video.
-      var part = filterLongLiveLike ? 'snippet,contentDetails,liveStreamingDetails' : 'contentDetails';
+      var part = filterLivestreams ? 'snippet,contentDetails,liveStreamingDetails' : 'contentDetails';
       var response = YouTube.Videos.list(part, {id: batch.join(',')});
       if (!response || !response.items) {
         recordRowError("filter", "Video metadata returned an invalid response for a batch of " + batch.length + " videos");
@@ -828,8 +848,8 @@ function applyFilters(videoIds, sheet, iRow) {
           Logger.log("Filtered short: " + videoId + " | duration: " + duration);
           keep = false;
         }
-        if (keep && filterLongLiveLike) {
-          keep = passesLiveLikeFilter(videoId, item);
+        if (keep && filterLivestreams) {
+          keep = passesLiveLikeFilter(videoId, item, livestreamFilterMode);
         }
         if (keep) filteredVideoIds.push(videoId);
       });
@@ -846,6 +866,45 @@ function applyFilters(videoIds, sheet, iRow) {
   return filteredVideoIds;
 }
 
+// Column F accepts Strict/No/All, Long/Legacy/2h, or Off/Yes/Keep.
+// Blank cells use defaultLivestreamFilterMode so an older sheet that lacks the
+// newer column cannot silently disable livestream filtering.
+function getLivestreamFilterMode(sheet, iRow) {
+  var rawSetting = normalizeCellValue(
+    sheet.getRange(iRow + 1, reservedColumnLongVideosFilter + 1).getValue()
+  );
+  var parsedMode = parseLivestreamFilterMode(rawSetting);
+  if (parsedMode) return parsedMode;
+
+  var fallbackMode = parseLivestreamFilterMode(defaultLivestreamFilterMode) || "strict";
+  if (rawSetting) {
+    recordRowWarning(
+      "filter",
+      "Unknown livestream filter setting '" + rawSetting + "' in column F; using " + fallbackMode.toUpperCase()
+    );
+  }
+  return fallbackMode;
+}
+
+function parseLivestreamFilterMode(value) {
+  var setting = normalizeCellValue(value).toLowerCase();
+  if (!setting) return null;
+
+  if (setting == "strict" || setting == "no" || setting == "all" ||
+      setting == "all live" || setting == "all livestreams" || setting == "no livestreams") {
+    return "strict";
+  }
+  if (setting == "long" || setting == "legacy" || setting == "2h" ||
+      setting == "over 2h" || setting == "over 2 hours") {
+    return "long";
+  }
+  if (setting == "off" || setting == "yes" || setting == "keep" ||
+      setting == "none" || setting == "disabled") {
+    return "off";
+  }
+  return null;
+}
+
 // Checks if an ISO 8601 duration is less or equal than three minutes.
 // Verifying the duration is of the form PT1M or PTXXX.XXXS where X represents digits.
 
@@ -859,19 +918,35 @@ function isLessThanThreeMinutes(duration) {
   return duration.match("^PT([12]M|[1-5]?[0-9]S){1,2}$") != null;
 }
 
-// Returns false if an active livestream is found, or if a livestream/premiere-like video is longer than two hours.
-// Normal uploaded videos over two hours are kept.
-// This assumes finished premieres are normally under two hours, so long live-like videos are treated as livestream/VOD content.
-function passesLiveLikeFilter(videoId, item) {
+// Applies the selected policy to videos that the public API marks as live-like.
+// The API does not expose a reliable discriminator between a completed stream
+// and a completed Premiere, so Strict and Long intentionally represent two
+// different policy tradeoffs rather than pretending that distinction exists.
+function passesLiveLikeFilter(videoId, item, livestreamFilterMode) {
   if (!isLiveLikeVideo(item)) return true;
+  livestreamFilterMode = parseLivestreamFilterMode(livestreamFilterMode) ||
+    parseLivestreamFilterMode(defaultLivestreamFilterMode) || "strict";
 
   var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
+  if (liveBroadcastContent == "upcoming") {
+    Logger.log("Kept upcoming live-like video to preserve possible Premiere: " + videoId);
+    return true;
+  }
+
   if (liveBroadcastContent == "live") {
     Logger.log("Filtered active livestream: " + videoId);
     return false;
   }
 
   var duration = item.contentDetails && item.contentDetails.duration;
+  if (livestreamFilterMode == "strict") {
+    Logger.log(
+      "Filtered completed live-like video in STRICT mode: " + videoId +
+      (duration ? " | duration: " + duration : "")
+    );
+    return false;
+  }
+
   if (duration && isOverTwoHours(duration)) {
     Logger.log("Filtered live-like video over 2 hours: " + videoId + " | duration: " + duration);
     return false;
@@ -879,15 +954,19 @@ function passesLiveLikeFilter(videoId, item) {
 
   var liveWindowSeconds = getLiveWindowSeconds(item.liveStreamingDetails, liveBroadcastContent);
   if (liveWindowSeconds !== null && liveWindowSeconds > 2 * 60 * 60) {
-    Logger.log("Filtered active live-like video over 2 hours: " + videoId + " | live window seconds: " + liveWindowSeconds);
+    Logger.log("Filtered live-like video with a live window over 2 hours: " + videoId + " | live window seconds: " + liveWindowSeconds);
     return false;
   }
 
-  // Deliberately unchanged: "upcoming" by itself is not blocked. That state can
-  // represent a premiere, which must remain eligible for a future run.
+  Logger.log(
+    "Kept completed live-like video under the two-hour LONG threshold: " + videoId +
+    (duration ? " | duration: " + duration : "")
+  );
   return true;
 }
 
+// liveBroadcastContent only identifies upcoming/active state. Once a broadcast
+// completes it becomes "none", while liveStreamingDetails remains present.
 function isLiveLikeVideo(item) {
   var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
   return !!item.liveStreamingDetails || liveBroadcastContent == "live" || liveBroadcastContent == "upcoming";
