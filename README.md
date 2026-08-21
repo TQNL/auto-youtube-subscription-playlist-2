@@ -1,5 +1,12 @@
-# Description 
+# Description
 This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
+
+> **TQNL reliability fork:** development in this fork is strict and evidence-led.
+> The current production candidate is `sheetScript.gs`; immutable prior iterations
+> are in [`versions/`](./versions), the experiment procedure is documented in
+> [`docs/EXPERIMENT_PROTOCOL.md`](./docs/EXPERIMENT_PROTOCOL.md), and the deliberate
+> Premiere/livestream tradeoff is documented in
+> [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md).
 
 This is done using Google Sheets for interface, Google Script + Youtube API v3 for executing and scheduling.
 
