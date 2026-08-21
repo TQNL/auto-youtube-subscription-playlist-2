@@ -1,5 +1,6 @@
-// Reliability-fixed version: 2026-07-18
+// Reliability-fixed version: 2026-07-21
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
+// Permanent missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
 // This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
 // Code: https://github.com/Elijas/auto-youtube-subscription-playlist-2/
@@ -18,6 +19,7 @@ var playlistWriteOperationsUsed = 0;
 // failures are tracked separately so one broken source cannot cancel videos
 // obtained from healthy sources.
 var totalErrorCount = 0;
+var totalWarningCount = 0;
 var currentRowStatus = null;
 var targetPlaylistVideoCache = {};
 var debugFlag_dontUpdateTimestamp = false;
@@ -71,6 +73,7 @@ function updatePlaylists(sheet) {
 
   try {
     totalErrorCount = 0;
+    totalWarningCount = 0;
     playlistWriteOperationsUsed = 0;
     targetPlaylistVideoCache = {};
     return updatePlaylistsLocked(sheet);
@@ -117,12 +120,21 @@ function updatePlaylistsLocked(sheet) {
     } finally {
       if (currentRowStatus.errorCount > 0) {
         Logger.log(
-          "Row completed with partial failures (source=" + currentRowStatus.sourceErrors +
+          "Row completed with blocking failures (source=" + currentRowStatus.sourceErrors +
           ", filter=" + currentRowStatus.filterErrors +
           ", write=" + currentRowStatus.writeErrors +
           ", maintenance=" + currentRowStatus.maintenanceErrors +
           ", unexpected=" + currentRowStatus.unexpectedErrors +
           "). Timestamp was not updated."
+        );
+      } else if (currentRowStatus.warningCount > 0) {
+        Logger.log(
+          "Row completed with non-blocking warnings (source=" + currentRowStatus.sourceWarnings +
+          ", filter=" + currentRowStatus.filterWarnings +
+          ", write=" + currentRowStatus.writeWarnings +
+          ", maintenance=" + currentRowStatus.maintenanceWarnings +
+          ", unexpected=" + currentRowStatus.unexpectedWarnings +
+          "). Timestamp " + (currentRowStatus.timestampUpdated ? "was updated." : "was not updated.")
         );
       }
 
@@ -132,12 +144,15 @@ function updatePlaylistsLocked(sheet) {
       }
       nextDebugRow += newLogs.length;
       totalErrorCount += currentRowStatus.errorCount;
+      totalWarningCount += currentRowStatus.warningCount;
       currentRowStatus = null;
     }
   }
 
-  if (totalErrorCount == 0) {
+  if (totalErrorCount == 0 && totalWarningCount == 0) {
     debugSheet.getRange(nextDebugRow + 1, nextDebugCol + 2).setValue("Updated all rows, script successfully finished");
+  } else if (totalErrorCount == 0) {
+    debugSheet.getRange(nextDebugRow + 1, nextDebugCol + 2).setValue("Updated all rows with " + totalWarningCount + " non-blocking warning(s)");
   } else {
     debugSheet.getRange(nextDebugRow + 1, nextDebugCol + 2).setValue("Script finished with partial failures");
   }
@@ -185,7 +200,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
       var sourceErrorsBefore = currentRowStatus.sourceErrors;
       var newChannelIds = getAllChannelIds();
       if (newChannelIds.length === 0 && currentRowStatus.sourceErrors === sourceErrorsBefore) {
-        recordRowError("source", "Could not find any subscriptions");
+        recordRowWarning("source", "The ALL source returned no subscriptions");
       } else {
         [].push.apply(channelIds, newChannelIds);
       }
@@ -195,12 +210,12 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
       try {
         var user = YouTube.Channels.list('id', {forUsername: source, maxResults: 1});
         if (!user || !user.items) recordRowError("source", "Cannot query for user " + source);
-        else if (user.items.length === 0) recordRowError("source", "No user with name " + source);
-        else if (user.items.length !== 1) recordRowError("source", "Multiple users with name " + source);
+        else if (user.items.length === 0) recordRowWarning("source", "No user with name " + source + "; source skipped");
+        else if (user.items.length !== 1) recordRowWarning("source", "Ambiguous user name " + source + "; source skipped");
         else if (!user.items[0].id) recordRowError("source", "Cannot get id from user " + source);
         else channelIds.push(user.items[0].id);
       } catch (e) {
-        recordRowError("source", "Cannot search for channel with name " + source + ": " + describeError(e));
+        recordSourceReadFailure("Cannot search for channel with name " + source, e);
       }
     } else {
       channelIds.push(source);
@@ -229,8 +244,9 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
   newVideoIds = applyFilters(newVideoIds, sheet, iRow);
   Logger.log("Filtering finished, left with " + newVideoIds.length + " videos");
 
-  // Source/filter errors do not cancel candidates from healthy sources. Any
-  // error still withholds the row timestamp so failed sources can be retried.
+  // Issues do not cancel candidates from healthy sources. Only failures that
+  // could lose retryable candidates (transient source/filter/write/unexpected)
+  // block the timestamp. Permanent bad-source and cleanup issues are warnings.
   if (!debugFlag_dontUpdatePlaylists) {
     addVideosToPlaylist(playlistId, newVideoIds);
   } else {
@@ -246,6 +262,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
 
   if (currentRowStatus.errorCount === 0 && !debugFlag_dontUpdateTimestamp) {
     sheet.getRange(iRow + 1, reservedColumnTimestamp + 1).setValue(new Date().toIsoString());
+    currentRowStatus.timestampUpdated = true;
   } else if (debugFlag_dontUpdateTimestamp) {
     Logger.log("Timestamp update disabled by debug flag");
   }
@@ -254,24 +271,63 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
 function createRowStatus() {
   return {
     sourceErrors: 0,
+    sourceWarnings: 0,
     filterErrors: 0,
+    filterWarnings: 0,
     writeErrors: 0,
+    writeWarnings: 0,
     maintenanceErrors: 0,
+    maintenanceWarnings: 0,
     unexpectedErrors: 0,
-    errorCount: 0
+    unexpectedWarnings: 0,
+    errorCount: 0,
+    warningCount: 0,
+    timestampUpdated: false
   };
 }
 
 function recordRowError(category, message) {
-  Logger.log("ERROR [" + category.toUpperCase() + "]: " + message);
-  if (!currentRowStatus) return;
-
-  var field = category + "Errors";
-  if (typeof currentRowStatus[field] !== "number") field = "unexpectedErrors";
-  currentRowStatus[field] += 1;
-  currentRowStatus.errorCount += 1;
+  recordRowIssue(category, message, true);
 }
 
+function recordRowWarning(category, message) {
+  recordRowIssue(category, message, false);
+}
+
+function recordRowIssue(category, message, blocksTimestamp) {
+  var severity = blocksTimestamp ? "ERROR" : "WARNING";
+  Logger.log(severity + " [" + category.toUpperCase() + "]: " + message);
+  if (!currentRowStatus) return;
+
+  var suffix = blocksTimestamp ? "Errors" : "Warnings";
+  var field = category + suffix;
+  if (typeof currentRowStatus[field] !== "number") field = "unexpected" + suffix;
+  currentRowStatus[field] += 1;
+  if (blocksTimestamp) currentRowStatus.errorCount += 1;
+  else currentRowStatus.warningCount += 1;
+}
+
+function isMissingSourceConfigurationError(e) {
+  var code = getErrorCode(e);
+  var reason = String(getErrorReason(e) || "").toLowerCase();
+  var message = String(e && e.message ? e.message : e || "").toLowerCase();
+  return code === 404 ||
+    reason.indexOf("notfound") >= 0 ||
+    reason === "invalidchannelid" ||
+    reason === "invalidplaylist" ||
+    message.indexOf("cannot be found") >= 0 ||
+    message.indexOf("not found") >= 0 ||
+    message.indexOf("does not exist") >= 0;
+}
+
+function recordSourceReadFailure(context, e) {
+  var message = context + ": " + describeError(e);
+  if (isMissingSourceConfigurationError(e)) {
+    recordRowWarning("source", message + ". Source skipped; fix or remove its sheet entry.");
+  } else {
+    recordRowError("source", message);
+  }
+}
 function normalizeCellValue(value) {
   return value === null || value === undefined ? "" : String(value).trim();
 }
@@ -421,7 +477,7 @@ function getVideoIds(channelId, lastTimestamp) {
         return videoIds;
       }
     } catch (e) {
-      recordRowError("source", "Cannot search YouTube with channel id " + channelId + ": " + describeError(e));
+      recordSourceReadFailure("Cannot search YouTube with channel id " + channelId, e);
       return videoIds;
     }
 
@@ -437,10 +493,10 @@ function getVideoIds(channelId, lastTimestamp) {
       if (!channelResults || !channelResults.items) {
         recordRowError("source", "YouTube channel search returned an invalid response for channel " + channelId);
       } else if (channelResults.items.length === 0) {
-        recordRowError("source", "Cannot find channel with id " + channelId);
+        recordRowWarning("source", "Cannot find channel with id " + channelId + "; source skipped");
       }
     } catch (e) {
-      recordRowError("source", "Cannot validate channel " + channelId + ": " + describeError(e));
+      recordSourceReadFailure("Cannot validate channel " + channelId, e);
     }
   }
 
@@ -460,12 +516,12 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
       return videoIds;
     }
     if (channelResults.items.length === 0) {
-      recordRowError("source", "Cannot find channel with id " + channelId);
+      recordRowWarning("source", "Cannot find channel with id " + channelId + "; source skipped");
       return videoIds;
     }
     uploadsPlaylistId = channelResults.items[0].contentDetails.relatedPlaylists.uploads;
   } catch (e) {
-    recordRowError("source", "Cannot search YouTube for channel " + channelId + ": " + describeError(e));
+    recordSourceReadFailure("Cannot search YouTube for channel " + channelId, e);
     return videoIds;
   }
 
@@ -496,11 +552,7 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
       if (results.items.length > 0 && videosToBeAdded.length === 0) break;
       nextPageToken = results.nextPageToken || null;
     } catch (e) {
-      if (getErrorCode(e) === 404) {
-        Logger.log("Warning: Channel " + channelId + " has no uploads playlist content in " + uploadsPlaylistId + ": " + describeError(e));
-      } else {
-        recordRowError("source", "Cannot search uploads playlist " + uploadsPlaylistId + ": " + describeError(e));
-      }
+      recordSourceReadFailure("Cannot search uploads playlist " + uploadsPlaylistId + " for channel " + channelId, e);
       return videoIds.reverse();
     }
   } while (nextPageToken !== null);
@@ -538,7 +590,7 @@ function getPlaylistVideoIds(playlistId, lastTimestamp) {
       });
       nextPageToken = results.nextPageToken || null;
     } catch (e) {
-      recordRowError("source", "Cannot read source playlist " + playlistId + ": " + describeError(e));
+      recordSourceReadFailure("Cannot read source playlist " + playlistId, e);
       return videoIds;
     }
   } while (nextPageToken !== null);
@@ -668,13 +720,13 @@ function deletePlaylistItems(playlistId, deleteBeforeTimestamp) {
         fields: 'nextPageToken,items(id,contentDetails(videoId,videoPublishedAt))'
       });
       if (!results || !results.items) {
-        recordRowError("maintenance", "Target playlist returned an invalid response while preparing deletion: " + playlistId);
+        recordRowWarning("maintenance", "Target playlist returned an invalid response while preparing deletion: " + playlistId);
         return;
       }
       [].push.apply(allItems, results.items);
       nextPageToken = results.nextPageToken || null;
     } catch (e) {
-      recordRowError("maintenance", "Cannot read target playlist " + playlistId + " before deletion: " + describeError(e));
+      recordRowWarning("maintenance", "Cannot read target playlist " + playlistId + " before deletion: " + describeError(e));
       return;
     }
   } while (nextPageToken !== null);
@@ -704,7 +756,7 @@ function deletePlaylistItems(playlistId, deleteBeforeTimestamp) {
 
   var remainingOperations = maxPlaylistWriteOperationsPerRun - playlistWriteOperationsUsed;
   if (itemIdsToDelete.length > remainingOperations) {
-    recordRowError(
+    recordRowWarning(
       "maintenance",
       "Refusing a partial deletion: " + itemIdsToDelete.length + " playlist items need removal, but only " +
       Math.max(0, remainingOperations) + " of the per-run safety budget remain. Nothing was deleted."
@@ -719,7 +771,7 @@ function deletePlaylistItems(playlistId, deleteBeforeTimestamp) {
       YouTube.PlaylistItems.remove(itemIdsToDelete[i]);
       removedCount += 1;
     } catch (e) {
-      recordRowError("maintenance", "Could not remove playlist item " + itemIdsToDelete[i] + " from " + playlistId + ": " + describeError(e));
+      recordRowWarning("maintenance", "Could not remove playlist item " + itemIdsToDelete[i] + " from " + playlistId + ": " + describeError(e));
     }
   }
   delete targetPlaylistVideoCache[playlistId];

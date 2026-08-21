@@ -63,7 +63,7 @@ function testExplicitPlaylistUsesSupportedPagination() {
   });
 }
 
-function testBrokenSourceDoesNotCancelHealthyInsert() {
+function testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp() {
   const inserted = [];
   let timestampWrites = 0;
   const ctx = makeContext({
@@ -78,9 +78,8 @@ function testBrokenSourceDoesNotCancelHealthyInsert() {
           return {items: [{contentDetails: {videoId: 'healthy-video', videoPublishedAt: '2026-07-18T08:00:00Z'}}]};
         }
         if (options.playlistId === 'PL_BROKEN_12345') {
-          const error = new Error('playlist not found');
-          error.details = {code: 404, errors: [{reason: 'playlistNotFound'}]};
-          throw error;
+          // Apps Script sometimes exposes only this message, without details.code.
+          throw new Error("API call failed: The playlist identified with the request's playlistId parameter cannot be found.");
         }
         if (options.playlistId === 'PL_TARGET_12345') return {items: []};
         throw new Error('unexpected playlist lookup ' + options.playlistId + ' / ' + part);
@@ -111,11 +110,78 @@ function testBrokenSourceDoesNotCancelHealthyInsert() {
   ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
 
   assert.deepStrictEqual(inserted, ['healthy-video']);
-  assert.strictEqual(ctx.currentRowStatus.sourceErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.sourceWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.sourceErrors, 0);
   assert.strictEqual(ctx.currentRowStatus.writeErrors, 0);
-  assert.strictEqual(timestampWrites, 0, 'failed source must keep the checkpoint unchanged');
+  assert.strictEqual(timestampWrites, 1, 'permanently missing source must not freeze the row checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, true);
 }
 
+function testTransientSourceErrorStillBlocksCheckpoint() {
+  let timestampWrites = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        const error = new Error('temporary backend failure');
+        error.details = {code: 503, errors: [{reason: 'backendError'}]};
+        throw error;
+      }
+    }
+  });
+  const sheet = {
+    getLastColumn: () => 7,
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 || column === 6 ? 'Yes' : ''),
+        setValue: () => { timestampWrites += 1; }
+      };
+    }
+  };
+  const data = [[], [], [], [
+    'PL_TARGET_12345', '2026-07-20T00:00:00Z', 0, 0, 'Yes', 'Yes', 'PL_TRANSIENT_12345'
+  ]];
+
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
+
+  assert.strictEqual(ctx.currentRowStatus.sourceErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.sourceWarnings, 0);
+  assert.strictEqual(timestampWrites, 0, 'transient source failures must retain the retry checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, false);
+}
+
+function testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint() {
+  let timestampWrites = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        const error = new Error('temporary cleanup failure');
+        error.details = {code: 503, errors: [{reason: 'backendError'}]};
+        throw error;
+      }
+    }
+  });
+  const sheet = {
+    getLastColumn: () => 6,
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 || column === 6 ? 'Yes' : ''),
+        setValue: () => { timestampWrites += 1; }
+      };
+    }
+  };
+  const data = [[], [], [], [
+    'PL_TARGET_12345', '2026-07-20T00:00:00Z', 0, 30, 'Yes', 'Yes'
+  ]];
+
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
+
+  assert.strictEqual(ctx.currentRowStatus.maintenanceWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
+  assert.strictEqual(timestampWrites, 1, 'independent cleanup failures must not freeze ingestion');
+  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, true);
+}
 function testFilterMetadataIsBatchedAndUpcomingIsKept() {
   const ids = Array.from({length: 50}, (_, i) => 'video-' + i);
   let listCalls = 0;
@@ -242,7 +308,9 @@ function testDeletionReadsAllPagesBeforeMutation() {
 
 const tests = [
   testExplicitPlaylistUsesSupportedPagination,
-  testBrokenSourceDoesNotCancelHealthyInsert,
+  testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp,
+  testTransientSourceErrorStillBlocksCheckpoint,
+  testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
   testFilterMetadataIsBatchedAndUpcomingIsKept,
   testFilterBatchFailureDoesNotCancelLaterBatch,
   testWriteBudgetRefusesPartialRow,
