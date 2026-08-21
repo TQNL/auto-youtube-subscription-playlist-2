@@ -89,6 +89,206 @@ function replayRow5StrictDryRun() {
   return replayStrictDryRun(5);
 }
 
+function diagnoseRow4TargetAccessReadOnly() {
+  return diagnoseTargetAccessReadOnly(4);
+}
+
+/**
+ * Identify which YouTube identity the current Apps Script authorization uses.
+ *
+ * This is deliberately read-only and never logs a channel ID, playlist ID, or
+ * source value. Channel titles are retained because they are
+ * the user-visible identity needed to diagnose Brand Account/default-channel
+ * mismatches.
+ */
+function diagnoseTargetAccessReadOnly(rowNumber, optionalSheet) {
+  rowNumber = Number(rowNumber);
+  if (!isFinite(rowNumber) || Math.floor(rowNumber) !== rowNumber ||
+      rowNumber < EXPERIMENT_FIRST_DATA_ROW_) {
+    throw new Error("Diagnostic row must be an integer at row 4 or later.");
+  }
+
+  var sheet = experimentConfigurationSheet_(optionalSheet);
+  var expectedSourceHash = sourceConfigurationFingerprint(sheet);
+
+  try {
+    var rawTarget = String(sheet.getRange(rowNumber, 1).getDisplayValue() || "");
+    var targetPlaylistId = rawTarget.trim();
+    if (!targetPlaylistId) throw new Error("Row " + rowNumber + " has no target playlist ID.");
+
+    var authorization = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL);
+    var channelsResponse = YouTube.Channels.list("id,snippet", {
+      mine: true,
+      maxResults: 50,
+      fields: "items(id,snippet(title))"
+    });
+    var authenticatedChannels = (channelsResponse && channelsResponse.items || []).map(function(item) {
+      return {
+        idHash: experimentSha256_("oauth-channel-v1\n" + String(item.id || "")),
+        title: item.snippet && item.snippet.title ? item.snippet.title : ""
+      };
+    });
+
+    var exactLookup = experimentReadOnlyApiProbe_(function() {
+      var response = YouTube.Playlists.list("id", {
+        id: targetPlaylistId,
+        maxResults: 1,
+        fields: "items(id)"
+      });
+      return {itemCount: response && response.items ? response.items.length : 0};
+    });
+
+    var targetPresentInMine = false;
+    var ownedPlaylistCount = 0;
+    var mineLookup = experimentReadOnlyApiProbe_(function() {
+      var nextPageToken = null;
+      var seenPageTokens = Object.create(null);
+      do {
+        var options = {
+          mine: true,
+          maxResults: 50,
+          fields: "nextPageToken,items(id)"
+        };
+        if (nextPageToken) options.pageToken = nextPageToken;
+        var page = YouTube.Playlists.list("id", options);
+        if (!page || !Array.isArray(page.items)) throw new Error("Owned-playlist lookup returned an invalid items array");
+        var items = page.items;
+        ownedPlaylistCount += items.length;
+        if (items.some(function(item) { return item.id === targetPlaylistId; })) {
+          targetPresentInMine = true;
+        }
+        var returnedToken = page.nextPageToken || null;
+        if (returnedToken && seenPageTokens[returnedToken]) throw new Error("Owned-playlist lookup returned a repeated page token");
+        if (returnedToken) seenPageTokens[returnedToken] = true;
+        nextPageToken = returnedToken;
+      } while (nextPageToken !== null && !targetPresentInMine);
+      return {
+        inspectedPlaylistCount: ownedPlaylistCount,
+        targetPresent: targetPresentInMine
+      };
+    });
+
+    var itemLookup = experimentReadOnlyApiProbe_(function() {
+      var response = YouTube.PlaylistItems.list("id", {
+        playlistId: targetPlaylistId,
+        maxResults: 1,
+        fields: "items(id)"
+      });
+      return {itemCount: response && response.items ? response.items.length : 0};
+    });
+
+    var explicitEmptyTokenLookup = experimentReadOnlyApiProbe_(function() {
+      var response = YouTube.PlaylistItems.list("id", {
+        playlistId: targetPlaylistId,
+        maxResults: 1,
+        pageToken: "",
+        fields: "items(id)"
+      });
+      return {itemCount: response && response.items ? response.items.length : 0};
+    });
+
+    var fullPagination = experimentReadOnlyTargetPaginationProbe_(targetPlaylistId);
+
+    assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
+    var report = {
+      schemaVersion: 1,
+      readOnly: true,
+      rowNumber: rowNumber,
+      sourceConfigurationHash: expectedSourceHash,
+      targetPlaylistHash: experimentSha256_("target-playlist-v1\n" + targetPlaylistId),
+      rawTargetLength: rawTarget.length,
+      trimmedTargetLength: targetPlaylistId.length,
+      hadOuterWhitespace: rawTarget !== targetPlaylistId,
+      authorizationStatus: String(authorization.getAuthorizationStatus()),
+      authorizedScopes: authorization.getAuthorizedScopes().slice().sort(),
+      authenticatedChannels: authenticatedChannels,
+      exactTargetLookup: exactLookup,
+      targetInAuthenticatedUsersPlaylists: mineLookup,
+      targetItemsLookup: itemLookup,
+      targetItemsWithExplicitEmptyPageToken: explicitEmptyTokenLookup,
+      fullTargetPagination: fullPagination,
+      mutationPerformed: false
+    };
+    Logger.log("TARGET_ACCESS_DIAGNOSTIC " + JSON.stringify(report));
+    return report;
+  } finally {
+    assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
+  }
+}
+
+function experimentReadOnlyTargetPaginationProbe_(targetPlaylistId) {
+  var nextPageToken = null;
+  var seenPageTokens = Object.create(null);
+  var pagesCompleted = 0;
+  var itemCount = 0;
+
+  do {
+    var params = {
+      playlistId: targetPlaylistId,
+      maxResults: 50,
+      fields: "nextPageToken,items(id)"
+    };
+    if (nextPageToken) params.pageToken = nextPageToken;
+
+    try {
+      var page = YouTube.PlaylistItems.list("id", params);
+      if (!page || !Array.isArray(page.items)) {
+        return {
+          ok: false,
+          reason: "invalid_response",
+          pageNumberAttempted: pagesCompleted + 1,
+          pagesCompleted: pagesCompleted,
+          itemCount: itemCount
+        };
+      }
+      pagesCompleted += 1;
+      itemCount += page.items.length;
+      var returnedToken = page.nextPageToken || null;
+      if (returnedToken && seenPageTokens[returnedToken]) {
+        return {
+          ok: false,
+          reason: "repeated_page_token",
+          pageNumberAttempted: pagesCompleted + 1,
+          pagesCompleted: pagesCompleted,
+          itemCount: itemCount
+        };
+      }
+      if (returnedToken) seenPageTokens[returnedToken] = true;
+      nextPageToken = returnedToken;
+    } catch (error) {
+      return {
+        ok: false,
+        reason: "api_error",
+        pageNumberAttempted: pagesCompleted + 1,
+        pagesCompleted: pagesCompleted,
+        itemCount: itemCount,
+        apiCode: experimentApiErrorCode_(error),
+        apiReason: experimentApiErrorReason_(error)
+      };
+    }
+  } while (nextPageToken !== null);
+
+  return {
+    ok: true,
+    pagesCompleted: pagesCompleted,
+    itemCount: itemCount
+  };
+}
+
+function experimentReadOnlyApiProbe_(callback) {
+  try {
+    var value = callback() || {};
+    value.ok = true;
+    return value;
+  } catch (error) {
+    return {
+      ok: false,
+      apiCode: experimentApiErrorCode_(error),
+      apiReason: experimentApiErrorReason_(error)
+    };
+  }
+}
+
 /**
  * Read-only replay of one configured playlist row under the strict policy.
  *
@@ -168,6 +368,13 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
       issues: state.issues
     };
 
+    // Apps Script truncates an individual Logger line at roughly 8 KiB. Large
+    // subscription rows can contain hundreds of source hashes, so emit the
+    // decision evidence first in a compact line that remains independently
+    // readable even when the full forensic payload below is truncated.
+    var summary = experimentReplaySummary_(result);
+    Logger.log("STRICT_REPLAY_SUMMARY " + JSON.stringify(summary));
+
     // The structured line contains video IDs for comparison, but no channel IDs
     // or source-playlist IDs. Raw sources remain local variables only.
     Logger.log("STRICT_REPLAY_RESULT " + JSON.stringify(result));
@@ -175,6 +382,58 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
   } finally {
     assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
   }
+}
+
+function experimentReplaySummary_(result) {
+  var rejectionCounts = Object.create(null);
+  (result.rejectedCandidates || []).forEach(function(candidate) {
+    var key = candidate.classification || candidate.reason || "UNKNOWN";
+    rejectionCounts[key] = (rejectionCounts[key] || 0) + 1;
+  });
+
+  var withheldCounts = Object.create(null);
+  (result.withheldCandidates || []).forEach(function(candidate) {
+    var key = candidate.reason || "UNKNOWN";
+    withheldCounts[key] = (withheldCounts[key] || 0) + 1;
+  });
+
+  return {
+    schemaVersion: result.schemaVersion,
+    policy: result.policy,
+    dryRun: result.dryRun,
+    rowNumber: result.rowNumber,
+    timestampReadFromColumnB: result.timestampReadFromColumnB,
+    sourceConfigurationHash: result.sourceConfigurationHash,
+    rowSourceHash: result.rowSourceHash,
+    sourceCount: result.sourceCount,
+    filterShorts: result.filterShorts,
+    columnFIgnoredByStrictPolicy: result.columnFIgnoredByStrictPolicy,
+    acquiredCandidateCount: (result.acquiredCandidateIds || []).length,
+    keptCandidateCount: (result.keptCandidateIds || []).length,
+    rejectedCandidateCount: (result.rejectedCandidates || []).length,
+    withheldCandidateCount: (result.withheldCandidates || []).length,
+    rejectionCounts: rejectionCounts,
+    withheldCounts: withheldCounts,
+    rejectedCandidateSamples: (result.rejectedCandidates || []).slice(0, 25),
+    issueCount: (result.issues || []).length,
+    issueSamples: (result.issues || []).slice(0, 10).map(experimentCompactIssue_),
+    targetReadComplete: result.targetReadComplete,
+    blockingErrorCount: result.blockingErrorCount,
+    warningCount: result.warningCount,
+    checkpointWouldAdvance: result.checkpointWouldAdvance
+  };
+}
+
+function experimentCompactIssue_(issue) {
+  return {
+    severity: issue.severity,
+    stage: issue.stage,
+    reason: issue.reason,
+    sourceColumn: issue.sourceColumn,
+    videoId: issue.videoId,
+    apiCode: issue.apiCode,
+    apiReason: issue.apiReason
+  };
 }
 
 function experimentConfigurationSheet_(optionalSheet) {
@@ -303,6 +562,7 @@ function experimentAcquireCandidates_(sources, timestamp, state) {
 function experimentReadSubscriptionIds_(source, state) {
   var channelIds = [];
   var nextPageToken = null;
+  var seenPageTokens = Object.create(null);
   var readCompleted = false;
   try {
     do {
@@ -314,20 +574,33 @@ function experimentReadSubscriptionIds_(source, state) {
       };
       if (nextPageToken) options.pageToken = nextPageToken;
       var response = YouTube.Subscriptions.list("snippet", options);
-      if (!response || !response.items) {
+      if (!response || !Array.isArray(response.items)) {
         experimentIssue_(state, "error", "source", "subscriptions_response_invalid", source);
         return channelIds;
       }
       response.items.forEach(function(item) {
         var channelId = item && item.snippet && item.snippet.resourceId &&
           item.snippet.resourceId.channelId;
-        if (channelId) channelIds.push(channelId);
+        if (!channelId) {
+          experimentIssue_(state, "error", "source", "subscription_item_metadata_invalid", source);
+          return;
+        }
+        channelIds.push(channelId);
       });
-      nextPageToken = response.nextPageToken || null;
+      var returnedToken = response.nextPageToken || null;
+      if (returnedToken && seenPageTokens[returnedToken]) {
+        experimentIssue_(state, "error", "source", "subscriptions_page_token_repeated", source);
+        return channelIds;
+      }
+      if (returnedToken) seenPageTokens[returnedToken] = true;
+      nextPageToken = returnedToken;
     } while (nextPageToken);
     readCompleted = true;
   } catch (error) {
-    experimentApiIssue_(state, "source", "subscriptions_read_failed", source, error);
+    // ALL is not a configured channel/playlist that can be safely treated as
+    // permanently absent. Any subscription-list failure leaves the ALL source
+    // incomplete, even when the API happens to report a 404-like reason.
+    experimentIssue_(state, "error", "source", "subscriptions_read_failed", source, error);
   }
   if (readCompleted && channelIds.length === 0) {
     experimentIssue_(state, "warning", "source", "subscriptions_empty", source);
@@ -342,7 +615,7 @@ function experimentResolveUsername_(source, state) {
       maxResults: 1,
       fields: "items(id)"
     });
-    if (!response || !response.items) {
+    if (!response || !Array.isArray(response.items)) {
       experimentIssue_(state, "error", "source", "username_response_invalid", source);
       return null;
     }
@@ -366,7 +639,7 @@ function experimentReadChannelVideos_(channelId, checkpointMillis, source, state
       maxResults: 1,
       fields: "items(contentDetails(relatedPlaylists(uploads)))"
     });
-    if (!channelResponse || !channelResponse.items) {
+    if (!channelResponse || !Array.isArray(channelResponse.items)) {
       experimentIssue_(state, "error", "source", "channel_response_invalid", source);
       return videoIds;
     }
@@ -387,6 +660,8 @@ function experimentReadChannelVideos_(channelId, checkpointMillis, source, state
   }
 
   var nextPageToken = null;
+  var seenPageTokens = Object.create(null);
+  var pagesRead = 0;
   do {
     try {
       var options = {
@@ -396,10 +671,11 @@ function experimentReadChannelVideos_(channelId, checkpointMillis, source, state
       };
       if (nextPageToken) options.pageToken = nextPageToken;
       var response = YouTube.PlaylistItems.list("contentDetails", options);
-      if (!response || !response.items) {
+      if (!response || !Array.isArray(response.items)) {
         experimentIssue_(state, "error", "source", "uploads_response_invalid", source);
         return videoIds.reverse();
       }
+      pagesRead += 1;
 
       var pageHasCandidate = false;
       var pageHasUnknown = false;
@@ -420,9 +696,21 @@ function experimentReadChannelVideos_(channelId, checkpointMillis, source, state
       // Uploads playlists are newest-first. Continue if the page had unknown
       // entries; otherwise a wholly old page proves all later pages are older.
       if (response.items.length > 0 && !pageHasCandidate && !pageHasUnknown) break;
-      nextPageToken = response.nextPageToken || null;
+      var returnedToken = response.nextPageToken || null;
+      if (returnedToken && seenPageTokens[returnedToken]) {
+        experimentIssue_(state, "error", "source", "uploads_page_token_repeated", source);
+        return videoIds.reverse();
+      }
+      if (returnedToken) seenPageTokens[returnedToken] = true;
+      nextPageToken = returnedToken;
     } catch (error) {
-      experimentApiIssue_(state, "source", "uploads_playlist_read_failed", source, error);
+      experimentSourcePageApiIssue_(
+        state,
+        "uploads_playlist_read_failed",
+        source,
+        error,
+        pagesRead
+      );
       return videoIds.reverse();
     }
   } while (nextPageToken);
@@ -433,6 +721,8 @@ function experimentReadChannelVideos_(channelId, checkpointMillis, source, state
 function experimentReadSourcePlaylistVideos_(playlistId, checkpointMillis, source, state) {
   var videoIds = [];
   var nextPageToken = null;
+  var seenPageTokens = Object.create(null);
+  var pagesRead = 0;
   do {
     try {
       var options = {
@@ -442,10 +732,11 @@ function experimentReadSourcePlaylistVideos_(playlistId, checkpointMillis, sourc
       };
       if (nextPageToken) options.pageToken = nextPageToken;
       var response = YouTube.PlaylistItems.list("snippet", options);
-      if (!response || !response.items) {
+      if (!response || !Array.isArray(response.items)) {
         experimentIssue_(state, "error", "source", "source_playlist_response_invalid", source);
         return videoIds;
       }
+      pagesRead += 1;
       response.items.forEach(function(item) {
         var snippet = item && item.snippet;
         var videoId = snippet && snippet.resourceId && snippet.resourceId.videoId;
@@ -454,11 +745,23 @@ function experimentReadSourcePlaylistVideos_(playlistId, checkpointMillis, sourc
           experimentIssue_(state, "error", "source", "source_playlist_item_metadata_invalid", source);
           return;
         }
-        if (publishedMillis > checkpointMillis) videoIds.push(videoId);
+        if (publishedMillis >= checkpointMillis) videoIds.push(videoId);
       });
-      nextPageToken = response.nextPageToken || null;
+      var returnedToken = response.nextPageToken || null;
+      if (returnedToken && seenPageTokens[returnedToken]) {
+        experimentIssue_(state, "error", "source", "source_playlist_page_token_repeated", source);
+        return videoIds;
+      }
+      if (returnedToken) seenPageTokens[returnedToken] = true;
+      nextPageToken = returnedToken;
     } catch (error) {
-      experimentApiIssue_(state, "source", "source_playlist_read_failed", source, error);
+      experimentSourcePageApiIssue_(
+        state,
+        "source_playlist_read_failed",
+        source,
+        error,
+        pagesRead
+      );
       return videoIds;
     }
   } while (nextPageToken);
@@ -474,7 +777,6 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
     try {
       response = YouTube.Videos.list("snippet,contentDetails,liveStreamingDetails", {
         id: batch.join(","),
-        maxResults: 50,
         fields: "items(id,snippet(liveBroadcastContent),contentDetails(duration),liveStreamingDetails)"
       });
     } catch (error) {
@@ -485,7 +787,7 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
       continue;
     }
 
-    if (!response || !response.items) {
+    if (!response || !Array.isArray(response.items)) {
       experimentIssue_(state, "error", "filter", "video_metadata_response_invalid");
       batch.forEach(function(videoId) {
         result.withheld.push({videoId: videoId, reason: "metadata_response_invalid"});
@@ -493,7 +795,7 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
       continue;
     }
 
-    var byId = {};
+    var byId = Object.create(null);
     response.items.forEach(function(item) {
       if (item && item.id) byId[item.id] = item;
     });
@@ -565,8 +867,10 @@ function experimentStrictClassification_(item) {
 }
 
 function experimentReadTargetVideoSet_(playlistId, state) {
-  var videoSet = {};
+  var videoSet = Object.create(null);
   var nextPageToken = null;
+  var seenPageTokens = Object.create(null);
+  var readComplete = true;
   do {
     try {
       var options = {
@@ -576,21 +880,34 @@ function experimentReadTargetVideoSet_(playlistId, state) {
       };
       if (nextPageToken) options.pageToken = nextPageToken;
       var response = YouTube.PlaylistItems.list("contentDetails", options);
-      if (!response || !response.items) {
+      if (!response || !Array.isArray(response.items)) {
         experimentIssue_(state, "error", "target", "target_playlist_response_invalid");
         return {ok: false, videoSet: videoSet};
       }
       response.items.forEach(function(item) {
         var videoId = item && item.contentDetails && item.contentDetails.videoId;
-        if (videoId) videoSet[videoId] = true;
+        if (!videoId) {
+          readComplete = false;
+          experimentIssue_(state, "error", "target", "target_playlist_item_metadata_invalid");
+          return;
+        }
+        videoSet[videoId] = true;
       });
-      nextPageToken = response.nextPageToken || null;
+      var returnedToken = response.nextPageToken || null;
+      if (returnedToken && seenPageTokens[returnedToken]) {
+        experimentIssue_(state, "error", "target", "target_playlist_page_token_repeated");
+        return {ok: false, videoSet: videoSet};
+      }
+      if (returnedToken) seenPageTokens[returnedToken] = true;
+      nextPageToken = returnedToken;
     } catch (error) {
-      experimentApiIssue_(state, "target", "target_playlist_read_failed", null, error);
+      // A target read is never an optional missing-source condition. The
+      // replay cannot safely predict de-duplication or checkpoint advancement.
+      experimentIssue_(state, "error", "target", "target_playlist_read_failed", null, error);
       return {ok: false, videoSet: videoSet};
     }
   } while (nextPageToken);
-  return {ok: true, videoSet: videoSet};
+  return {ok: readComplete, videoSet: videoSet};
 }
 
 function experimentIsShort_(duration) {
@@ -636,8 +953,12 @@ function experimentIssue_(state, severity, stage, reason, source, error, videoId
 function experimentApiIssue_(state, stage, reason, source, error) {
   var code = experimentApiErrorCode_(error);
   var apiReason = experimentApiErrorReason_(error).toLowerCase();
-  var permanentMissing = code === 404 || apiReason.indexOf("notfound") >= 0 ||
-    apiReason === "invalidchannelid" || apiReason === "invalidplaylist";
+  var permanentMissing = stage === "source" && (
+    typeof isMissingSourceConfigurationError === "function"
+      ? isMissingSourceConfigurationError(error)
+      : code === 404 || apiReason.indexOf("notfound") >= 0 ||
+        apiReason === "invalidchannelid" || apiReason === "invalidplaylist"
+  );
   experimentIssue_(
     state,
     permanentMissing ? "warning" : "error",
@@ -646,6 +967,14 @@ function experimentApiIssue_(state, stage, reason, source, error) {
     source,
     error
   );
+}
+
+function experimentSourcePageApiIssue_(state, reason, source, error, pagesRead) {
+  if (pagesRead === 0) {
+    experimentApiIssue_(state, "source", reason, source, error);
+    return;
+  }
+  experimentIssue_(state, "error", "source", reason, source, error);
 }
 
 function experimentApiErrorCode_(error) {
@@ -663,9 +992,9 @@ function experimentApiErrorReason_(error) {
 }
 
 function experimentDedupe_(values) {
-  var seen = {};
+  var seen = Object.create(null);
   return values.filter(function(value) {
-    if (!value || seen[value]) return false;
+    if (!value || Object.prototype.hasOwnProperty.call(seen, value)) return false;
     seen[value] = true;
     return true;
   });
