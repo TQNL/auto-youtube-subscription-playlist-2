@@ -88,19 +88,29 @@ function testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp() {
         inserted.push(resource.snippet.resourceId.videoId);
       },
       remove() {}
+    },
+    Videos: {
+      list() {
+        return {items: [{
+          id: 'healthy-video',
+          snippet: {liveBroadcastContent: 'none'},
+          contentDetails: {duration: 'PT10M'}
+        }]};
+      }
     }
   });
   const sheet = {
     getLastColumn: () => 8,
     getRange(row, column) {
       return {
-        getValue: () => (column === 5 || column === 6 ? 'Yes' : ''),
+        getValue: () => (column === 5 ? 'Yes' : (column === 6 ? 2 : '')),
+        getDisplayValue: () => (column === 6 ? '2' : ''),
         setValue: () => { timestampWrites += 1; }
       };
     }
   };
   const data = [[], [], [], [
-    'PL_TARGET_12345', '2026-07-17T00:00:00Z', 0, 0, 'Yes', 'Yes',
+    'PL_TARGET_12345', '2026-07-17T00:00:00Z', 0, 0, 'Yes', 2,
     'UC_HEALTHY_12345', 'PL_BROKEN_12345'
   ]];
 
@@ -218,7 +228,14 @@ function testFilterMetadataIsBatchedAndUpcomingIsKept() {
       }
     }
   });
-  const sheet = {getRange: () => ({getValue: () => 'No'})};
+  const sheet = {
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 ? 'No' : 2),
+        getDisplayValue: () => (column === 6 ? '2' : '')
+      };
+    }
+  };
   ctx.currentRowStatus = ctx.createRowStatus();
   const result = Array.from(ctx.applyFilters(ids, sheet, 3));
 
@@ -230,49 +247,61 @@ function testFilterMetadataIsBatchedAndUpcomingIsKept() {
   assert.ok(!result.includes('video-3'));
 }
 
-function testBlankLivestreamSettingDefaultsToStrictAndRejectsShortArchive() {
+function testBlankCutoffDefaultsToTwoHoursAndRejectsLongArchives() {
   let requestedPart = '';
   const ctx = makeContext({
     Videos: {
       list(part) {
         requestedPart = part;
-        return {items: [{
-          id: 'dashpum-stream',
-          snippet: {liveBroadcastContent: 'none'},
-          contentDetails: {duration: 'PT1H56M7S'},
-          liveStreamingDetails: {
-            actualStartTime: '2026-08-03T18:00:00Z',
-            actualEndTime: '2026-08-03T19:56:07Z'
+        return {items: [
+          {
+            id: 'ashswag-stream',
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT2H33M33S'},
+            liveStreamingDetails: {
+              actualStartTime: '2026-08-01T18:00:00Z',
+              actualEndTime: '2026-08-01T20:33:33Z'
+            }
+          },
+          {
+            id: 'midnight-stream',
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT3H33M15S'},
+            liveStreamingDetails: {
+              actualStartTime: '2026-08-01T18:00:00Z',
+              actualEndTime: '2026-08-01T21:33:15Z'
+            }
           }
-        }]};
+        ]};
       }
     }
   });
   const sheet = {
     getRange(row, column) {
-      return {getValue: () => (column === 5 ? 'Yes' : '')};
+      return {getValue: () => (column === 5 ? 'Yes' : ''), getDisplayValue: () => ''};
     }
   };
   ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(['dashpum-stream'], sheet, 3));
+  const result = Array.from(ctx.applyFilters(['ashswag-stream', 'midnight-stream'], sheet, 3));
 
   assert.deepStrictEqual(result, []);
   assert.ok(requestedPart.includes('liveStreamingDetails'));
-  assert.ok(ctx.__logs.some(line => line.includes('Livestream filter mode: STRICT')));
-  assert.ok(ctx.__logs.some(line => line.includes('PT1H56M7S')));
+  assert.ok(ctx.__logs.some(line => line.includes('Completed-livestream duration cutoff: 2:00:00')));
+  assert.ok(ctx.__logs.some(line => line.includes('PT2H33M33S')));
+  assert.ok(ctx.__logs.some(line => line.includes('PT3H33M15S')));
 }
 
-function testLongModeDocumentsAndKeepsShortCompletedLiveLikeVideo() {
+function testNumericThreeHourCutoffKeepsTwoAndAHalfHourArchive() {
   const ctx = makeContext({
     Videos: {
       list() {
         return {items: [{
-          id: 'short-archive',
+          id: 'ashswag-stream',
           snippet: {liveBroadcastContent: 'none'},
-          contentDetails: {duration: 'PT1H56M7S'},
+          contentDetails: {duration: 'PT2H33M33S'},
           liveStreamingDetails: {
             actualStartTime: '2026-08-03T18:00:00Z',
-            actualEndTime: '2026-08-03T19:56:07Z'
+            actualEndTime: '2026-08-03T20:33:33Z'
           }
         }]};
       }
@@ -280,27 +309,115 @@ function testLongModeDocumentsAndKeepsShortCompletedLiveLikeVideo() {
   });
   const sheet = {
     getRange(row, column) {
-      return {getValue: () => (column === 5 ? 'Yes' : 'Long')};
+      return {
+        getValue: () => (column === 5 ? 'Yes' : 3),
+        getDisplayValue: () => (column === 6 ? '3' : '')
+      };
     }
   };
   ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(['short-archive'], sheet, 3));
+  const result = Array.from(ctx.applyFilters(['ashswag-stream'], sheet, 3));
 
-  assert.deepStrictEqual(result, ['short-archive']);
-  assert.ok(ctx.__logs.some(line => line.includes('under the two-hour LONG threshold')));
+  assert.deepStrictEqual(result, ['ashswag-stream']);
+  assert.ok(ctx.__logs.some(line => line.includes('cutoff: 3:00:00')));
 }
 
-function testOffModeAvoidsMetadataRequest() {
+function testSheetDurationDisplayIsParsedAsDurationNotDayFraction() {
+  const ctx = makeContext();
+  const sheet = {
+    getRange() {
+      return {
+        getValue: () => 2.5 / 24,
+        getDisplayValue: () => '02:30:00'
+      };
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  assert.strictEqual(ctx.getLivestreamDurationCutoffSeconds(sheet, 3), 9000);
+}
+
+function testInvalidCutoffBlocksCheckpointAndUsesSafeDefault() {
+  const ctx = makeContext();
+  const sheet = {
+    getRange() {
+      return {getValue: () => 'two-ish', getDisplayValue: () => 'two-ish'};
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  assert.strictEqual(ctx.getLivestreamDurationCutoffSeconds(sheet, 3), 7200);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1);
+}
+
+function testCutoffUsesLongestObservedLiveDurationAndLeavesRegularUploadsAlone() {
+  const ids = ['regular-long-video', 'exactly-two-hour-stream', 'longer-live-window'];
   const ctx = makeContext({
-    Videos: {list() { throw new Error('videos.list must not be called'); }}
+    Videos: {
+      list() {
+        return {items: [
+          {
+            id: ids[0],
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT4H'}
+          },
+          {
+            id: ids[1],
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT2H'},
+            liveStreamingDetails: {
+              actualStartTime: '2026-08-01T18:00:00Z',
+              actualEndTime: '2026-08-01T20:00:00Z'
+            }
+          },
+          {
+            id: ids[2],
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT1H59M'},
+            liveStreamingDetails: {
+              actualStartTime: '2026-08-01T18:00:00Z',
+              actualEndTime: '2026-08-01T20:00:01Z'
+            }
+          }
+        ]};
+      }
+    }
   });
   const sheet = {
     getRange(row, column) {
-      return {getValue: () => (column === 5 ? 'Yes' : 'Off')};
+      return {
+        getValue: () => (column === 5 ? 'Yes' : 2),
+        getDisplayValue: () => (column === 6 ? '2' : '')
+      };
     }
   };
   ctx.currentRowStatus = ctx.createRowStatus();
-  assert.deepStrictEqual(Array.from(ctx.applyFilters(['normal-video'], sheet, 3)), ['normal-video']);
+  assert.deepStrictEqual(Array.from(ctx.applyFilters(ids, sheet, 3)), [ids[0], ids[1]]);
+}
+
+function testUnknownCompletedLiveDurationIsRetriedInsteadOfSlippingThrough() {
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [{
+          id: 'processing-stream',
+          snippet: {liveBroadcastContent: 'none'},
+          contentDetails: {duration: 'P0D'},
+          liveStreamingDetails: {actualStartTime: '2026-08-01T18:00:00Z'}
+        }]};
+      }
+    }
+  });
+  const sheet = {
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 ? 'Yes' : 2),
+        getDisplayValue: () => (column === 6 ? '2' : '')
+      };
+    }
+  };
+  ctx.currentRowStatus = ctx.createRowStatus();
+  assert.deepStrictEqual(Array.from(ctx.applyFilters(['processing-stream'], sheet, 3)), []);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 1);
 }
 
 function testFilterBatchFailureDoesNotCancelLaterBatch() {
@@ -319,7 +436,14 @@ function testFilterBatchFailureDoesNotCancelLaterBatch() {
       }
     }
   });
-  const sheet = {getRange: () => ({getValue: () => 'No'})};
+  const sheet = {
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 ? 'No' : 2),
+        getDisplayValue: () => (column === 6 ? '2' : '')
+      };
+    }
+  };
   ctx.currentRowStatus = ctx.createRowStatus();
   const result = Array.from(ctx.applyFilters(ids, sheet, 3));
 
@@ -385,9 +509,12 @@ const tests = [
   testTransientSourceErrorStillBlocksCheckpoint,
   testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
   testFilterMetadataIsBatchedAndUpcomingIsKept,
-  testBlankLivestreamSettingDefaultsToStrictAndRejectsShortArchive,
-  testLongModeDocumentsAndKeepsShortCompletedLiveLikeVideo,
-  testOffModeAvoidsMetadataRequest,
+  testBlankCutoffDefaultsToTwoHoursAndRejectsLongArchives,
+  testNumericThreeHourCutoffKeepsTwoAndAHalfHourArchive,
+  testSheetDurationDisplayIsParsedAsDurationNotDayFraction,
+  testInvalidCutoffBlocksCheckpointAndUsesSafeDefault,
+  testCutoffUsesLongestObservedLiveDurationAndLeavesRegularUploadsAlone,
+  testUnknownCompletedLiveDurationIsRetriedInsteadOfSlippingThrough,
   testFilterBatchFailureDoesNotCancelLaterBatch,
   testWriteBudgetRefusesPartialRow,
   testDeletionReadsAllPagesBeforeMutation
