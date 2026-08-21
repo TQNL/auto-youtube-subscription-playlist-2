@@ -1,4 +1,4 @@
-// Reliability-fixed version: 2026-08-04
+// Strict-ingestion experiment v5: 2026-08-21
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // Permanent missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -15,10 +15,11 @@
 var maxPlaylistWriteOperationsPerRun = 150;
 var playlistWriteOperationsUsed = 0;
 
-// Default completed-livestream duration cutoff when column F is blank.
-// The unit is hours, so 2 means 2:00:00. Column F can override this per row
-// with decimal hours (for example 1.5) or a duration (for example 02:30:00).
-var defaultLivestreamDurationCutoffHours = 2;
+// Strict policy: duration is never used to identify livestreams. A video is
+// admitted only when videos.list proves liveBroadcastContent == "none" and
+// liveStreamingDetails is absent. This intentionally rejects Premieres when
+// YouTube exposes them as broadcast-like; the public API has no reliable
+// completed-Premiere discriminator.
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -27,6 +28,7 @@ var totalErrorCount = 0;
 var totalWarningCount = 0;
 var currentRowStatus = null;
 var targetPlaylistVideoCache = {};
+var experimentDryRun = false;
 var debugFlag_dontUpdateTimestamp = false;
 var debugFlag_dontUpdatePlaylists = false;
 var debugFlag_logWhenNoNewVideosFound = false;
@@ -42,7 +44,7 @@ var reservedColumnTimestamp = 1;    // Column containing last timestamp
 var reservedColumnFrequency = 2;    // Column containing number of hours until new check
 var reservedColumnDeleteDays = 3;   // Column containing number of days before today until videos get deleted
 var reservedColumnShortsFilter = 4; // Column containing switch for using shorts filter
-var reservedColumnLivestreamDurationCutoff = 5; // Completed-livestream cutoff: hours or HH:MM[:SS]
+var reservedColumnLegacyLivestreamSetting = 5; // Reserved for sheet compatibility; strict policy ignores column F
 // Reserved lengths
 var reservedDebugNumRows = 900;   // Number of rows to use in a column before moving on to the next column in debug sheet
 var reservedDebugNumColumns = 26; // Number of columns to use in debug sheet, must be at least 4 to allow infinite cycle
@@ -127,6 +129,7 @@ function updatePlaylistsLocked(sheet) {
         Logger.log(
           "Row completed with blocking failures (source=" + currentRowStatus.sourceErrors +
           ", filter=" + currentRowStatus.filterErrors +
+          ", policy=" + currentRowStatus.policyErrors +
           ", write=" + currentRowStatus.writeErrors +
           ", maintenance=" + currentRowStatus.maintenanceErrors +
           ", unexpected=" + currentRowStatus.unexpectedErrors +
@@ -136,6 +139,7 @@ function updatePlaylistsLocked(sheet) {
         Logger.log(
           "Row completed with non-blocking warnings (source=" + currentRowStatus.sourceWarnings +
           ", filter=" + currentRowStatus.filterWarnings +
+          ", policy=" + currentRowStatus.policyWarnings +
           ", write=" + currentRowStatus.writeWarnings +
           ", maintenance=" + currentRowStatus.maintenanceWarnings +
           ", unexpected=" + currentRowStatus.unexpectedWarnings +
@@ -252,20 +256,24 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
   // Issues do not cancel candidates from healthy sources. Only failures that
   // could lose retryable candidates (transient source/filter/write/unexpected)
   // block the timestamp. Permanent bad-source and cleanup issues are warnings.
-  if (!debugFlag_dontUpdatePlaylists) {
+  if (experimentDryRun) {
+    Logger.log("[STRICT DRY RUN] Would submit " + newVideoIds.length + " strictly eligible video(s) for target de-duplication and insertion");
+  } else if (!debugFlag_dontUpdatePlaylists) {
     addVideosToPlaylist(playlistId, newVideoIds);
   } else {
     recordRowError("write", "Don't Update Playlists debug flag is set");
   }
 
   var daysBack = data[iRow][reservedColumnDeleteDays];
-  if (daysBack && daysBack > 0) {
+  if (!experimentDryRun && daysBack && daysBack > 0) {
     var deleteBeforeTimestamp = new Date((new Date()).getTime() - daysBack * MILLIS_PER_DAY).toIsoString();
     Logger.log("Delete before: " + deleteBeforeTimestamp);
     deletePlaylistItems(playlistId, deleteBeforeTimestamp);
   }
 
-  if (currentRowStatus.errorCount === 0 && !debugFlag_dontUpdateTimestamp) {
+  if (experimentDryRun) {
+    Logger.log("[STRICT DRY RUN] Timestamp and playlist were not modified");
+  } else if (currentRowStatus.errorCount === 0 && !debugFlag_dontUpdateTimestamp) {
     sheet.getRange(iRow + 1, reservedColumnTimestamp + 1).setValue(new Date().toIsoString());
     currentRowStatus.timestampUpdated = true;
   } else if (debugFlag_dontUpdateTimestamp) {
@@ -279,6 +287,8 @@ function createRowStatus() {
     sourceWarnings: 0,
     filterErrors: 0,
     filterWarnings: 0,
+    policyErrors: 0,
+    policyWarnings: 0,
     writeErrors: 0,
     writeWarnings: 0,
     maintenanceErrors: 0,
@@ -638,8 +648,198 @@ function getTargetPlaylistVideoSet(playlistId) {
   return videoSet;
 }
 
-// Add videos using an iterative, execution-wide mutation budget. If all
-// candidates cannot fit in the remaining budget, none from this row are added.
+// Non-mutating v5 audit. This deliberately does not repair the target yet: the
+// live experiment must first establish how many existing entries strict policy
+// would classify as broadcasts (including the Premiere tradeoff).
+function inspectTargetPlaylistStrict(playlistId) {
+  var playlistItems = [];
+  var nextPageToken = '';
+  do {
+    try {
+      var page = YouTube.PlaylistItems.list('id,contentDetails', {
+        playlistId: playlistId,
+        maxResults: 50,
+        pageToken: nextPageToken,
+        fields: 'nextPageToken,items(id,contentDetails(videoId))'
+      });
+      if (!page || !page.items) {
+        recordRowError("policy", "Strict target audit received an invalid playlist response");
+        return null;
+      }
+      [].push.apply(playlistItems, page.items);
+      nextPageToken = page.nextPageToken || null;
+    } catch (e) {
+      recordRowError("policy", "Cannot read target playlist during strict audit: " + describeError(e));
+      return null;
+    }
+  } while (nextPageToken !== null);
+
+  var videoIds = dedupeVideoIds(playlistItems.map(function(item) {
+    return item && item.contentDetails && item.contentDetails.videoId;
+  }));
+  var counts = {
+    NORMAL_UPLOAD: 0,
+    UPCOMING: 0,
+    ACTIVE: 0,
+    COMPLETED_LIVE: 0,
+    UNKNOWN: 0
+  };
+
+  for (var start = 0; start < videoIds.length; start += 50) {
+    var batch = videoIds.slice(start, start + 50);
+    try {
+      var response = YouTube.Videos.list('snippet,contentDetails,liveStreamingDetails', {id: batch.join(',')});
+      if (!response || !response.items) {
+        recordRowError("policy", "Strict target audit received invalid metadata for batch starting with " + batch[0]);
+        counts.UNKNOWN += batch.length;
+        continue;
+      }
+
+      var itemsById = {};
+      response.items.forEach(function(item) {
+        if (item && item.id) itemsById[item.id] = item;
+      });
+      batch.forEach(function(videoId) {
+        var item = itemsById[videoId];
+        var classification = item ? classifyVideoStrict(item) : "UNKNOWN";
+        counts[classification] += 1;
+        if (classification != "NORMAL_UPLOAD") {
+          Logger.log("[STRICT TARGET AUDIT] " + classification + ": " + formatVideoEvidence(videoId, item));
+        }
+      });
+    } catch (e) {
+      recordRowError("policy", "Strict target metadata audit failed for batch starting with " + batch[0] + ": " + describeError(e));
+      counts.UNKNOWN += batch.length;
+    }
+  }
+
+  var report = {
+    playlistItemCount: playlistItems.length,
+    uniqueVideoCount: videoIds.length,
+    classifications: counts,
+    forbiddenCount: counts.UPCOMING + counts.ACTIVE + counts.COMPLETED_LIVE,
+    unknownCount: counts.UNKNOWN,
+    mutationPerformed: false
+  };
+  Logger.log("STRICT_TARGET_AUDIT_RESULT " + JSON.stringify(report));
+  return report;
+}
+
+// Re-check candidates immediately before insertion. The acquisition/filter pass
+// can be seconds earlier, so this closes the observable state-change window and
+// fails closed if metadata cannot be proven safe.
+function revalidateStrictCandidates(videoIds, context) {
+  var allowedVideoIds = [];
+  for (var start = 0; start < videoIds.length; start += 50) {
+    var batch = videoIds.slice(start, start + 50);
+    try {
+      var response = YouTube.Videos.list('snippet,contentDetails,liveStreamingDetails', {id: batch.join(',')});
+      if (!response || !response.items) {
+        recordRowError("policy", "Invalid metadata response while " + context + " for " + batch.length + " video(s)");
+        continue;
+      }
+
+      var itemsById = {};
+      response.items.forEach(function(item) {
+        if (item && item.id) itemsById[item.id] = item;
+      });
+
+      batch.forEach(function(videoId) {
+        var item = itemsById[videoId];
+        if (!item) {
+          recordRowError("policy", "Video " + videoId + " was omitted while " + context + "; withholding it for retry");
+          return;
+        }
+
+        var classification = classifyVideoStrict(item);
+        if (classification == "NORMAL_UPLOAD") {
+          allowedVideoIds.push(videoId);
+        } else if (classification == "UNKNOWN") {
+          recordRowError("policy", "Cannot prove video " + videoId + " is a normal upload while " + context + "; withholding it");
+        } else {
+          Logger.log("Strict policy rejected " + classification + " during " + context + ": " + formatVideoEvidence(videoId, item));
+        }
+      });
+    } catch (e) {
+      recordRowError("policy", "Cannot retrieve metadata while " + context + " for batch starting with " + batch[0] + ": " + describeError(e));
+    }
+  }
+  return allowedVideoIds;
+}
+
+function rollbackInsertedPlaylistItem(record, existingVideos, reason) {
+  if (!record || !record.playlistItemId) {
+    recordRowError("policy", "Cannot roll back inserted video " + (record && record.videoId ? record.videoId : "unknown") + " because the insert response had no playlist-item ID");
+    return false;
+  }
+  if (playlistWriteOperationsUsed >= maxPlaylistWriteOperationsPerRun) {
+    recordRowError("policy", "Cannot roll back inserted video " + record.videoId + " because the write safety budget is exhausted");
+    return false;
+  }
+
+  playlistWriteOperationsUsed += 1;
+  try {
+    YouTube.PlaylistItems.remove(record.playlistItemId);
+    delete existingVideos[record.videoId];
+    Logger.log("Rolled back inserted video " + record.videoId + ": " + reason);
+    return true;
+  } catch (e) {
+    recordRowError("policy", "Failed to roll back inserted video " + record.videoId + ": " + describeError(e));
+    return false;
+  }
+}
+
+// Re-check successful inserts and use the playlist-item ID returned by insert
+// for rollback. One potential rollback operation is reserved for each attempted
+// insert before mutation begins.
+function postValidateInsertedItems(records, existingVideos) {
+  for (var start = 0; start < records.length; start += 50) {
+    var batchRecords = records.slice(start, start + 50);
+    var batchIds = batchRecords.map(function(record) { return record.videoId; });
+    var response = null;
+    try {
+      response = YouTube.Videos.list('snippet,contentDetails,liveStreamingDetails', {id: batchIds.join(',')});
+    } catch (e) {
+      recordRowError("policy", "Post-insert metadata check failed for batch starting with " + batchIds[0] + ": " + describeError(e));
+      batchRecords.forEach(function(record) {
+        rollbackInsertedPlaylistItem(record, existingVideos, "post-insert metadata could not be verified");
+      });
+      continue;
+    }
+
+    if (!response || !response.items) {
+      recordRowError("policy", "Post-insert metadata returned an invalid response for " + batchRecords.length + " video(s)");
+      batchRecords.forEach(function(record) {
+        rollbackInsertedPlaylistItem(record, existingVideos, "post-insert metadata response was invalid");
+      });
+      continue;
+    }
+
+    var itemsById = {};
+    response.items.forEach(function(item) {
+      if (item && item.id) itemsById[item.id] = item;
+    });
+
+    batchRecords.forEach(function(record) {
+      var item = itemsById[record.videoId];
+      var classification = item ? classifyVideoStrict(item) : "UNKNOWN";
+      if (classification == "NORMAL_UPLOAD") return;
+
+      var reason = item ? "post-insert classification changed to " + classification : "video was omitted by post-insert metadata";
+      if (classification == "UNKNOWN") {
+        recordRowError("policy", "Post-insert state for video " + record.videoId + " is unverifiable");
+      } else {
+        recordRowWarning("policy", "Post-insert state for video " + record.videoId + " is " + classification + "; rolling it back");
+      }
+      rollbackInsertedPlaylistItem(record, existingVideos, reason);
+    });
+  }
+}
+
+// Add videos using an execution-wide mutation budget. At most half of the
+// remaining operations are used for insert attempts so every success retains a
+// reserved rollback operation. Oversized rows make bounded progress and retain
+// their checkpoint; retries de-duplicate the already completed insertions.
 function addVideosToPlaylist(playlistId, videoIds) {
   if (!videoIds.length) {
     Logger.log("No new videos yet.");
@@ -661,30 +861,49 @@ function addVideosToPlaylist(playlistId, videoIds) {
     return;
   }
 
+  pendingVideoIds = revalidateStrictCandidates(pendingVideoIds, "pre-insert strict revalidation");
+  if (!pendingVideoIds.length) {
+    Logger.log("No strictly eligible videos remain after pre-insert revalidation.");
+    return;
+  }
+
   var remainingOperations = maxPlaylistWriteOperationsPerRun - playlistWriteOperationsUsed;
-  if (pendingVideoIds.length > remainingOperations) {
+  var safeInsertCapacity = Math.floor(Math.max(0, remainingOperations) / 2);
+  if (safeInsertCapacity == 0) {
     recordRowError(
       "write",
-      "Refusing a partial insert: " + pendingVideoIds.length + " videos need playlist writes, but only " +
-      Math.max(0, remainingOperations) + " of the per-run safety budget remain. No videos from this row were inserted."
+      "No safe insert capacity remains after reserving rollback operations; " + pendingVideoIds.length + " video(s) deferred"
     );
     return;
+  }
+  if (pendingVideoIds.length > safeInsertCapacity) {
+    recordRowError(
+      "write",
+      "Write safety capacity permits " + safeInsertCapacity + " of " + pendingVideoIds.length +
+      " strictly eligible video(s); inserting that bounded subset and retaining the checkpoint for retry"
+    );
+    pendingVideoIds = pendingVideoIds.slice(0, safeInsertCapacity);
   }
 
   var successCount = 0;
   var skippedCount = 0;
   var errorCount = 0;
+  var insertedRecords = [];
   for (var i = 0; i < pendingVideoIds.length; i++) {
     var videoId = pendingVideoIds[i];
     playlistWriteOperationsUsed += 1;
     try {
-      YouTube.PlaylistItems.insert({
+      var insertedResource = YouTube.PlaylistItems.insert({
         snippet: {
           playlistId: playlistId,
           resourceId: {videoId: videoId, kind: 'youtube#video'}
         }
       }, 'snippet');
       existingVideos[videoId] = true;
+      insertedRecords.push({
+        videoId: videoId,
+        playlistItemId: insertedResource && insertedResource.id ? insertedResource.id : null
+      });
       successCount += 1;
     } catch (e) {
       var code = getErrorCode(e);
@@ -707,6 +926,7 @@ function addVideosToPlaylist(playlistId, videoIds) {
     }
   }
 
+  if (insertedRecords.length > 0) postValidateInsertedItems(insertedRecords, existingVideos);
   Logger.log("Added " + successCount + " video(s); skipped " + skippedCount + "; failed " + errorCount + ".");
 }
 
@@ -794,11 +1014,9 @@ function applyFilters(videoIds, sheet, iRow) {
     sheet.getRange(iRow + 1, reservedColumnShortsFilter + 1).getValue()
   ).toLowerCase();
   var filterShorts = shortsSetting == "no";
-  var livestreamCutoffSeconds = getLivestreamDurationCutoffSeconds(sheet, iRow);
 
   if (filterShorts) Logger.log("Removing shorts");
-  Logger.log("Completed-livestream duration cutoff: " + formatDurationSeconds(livestreamCutoffSeconds));
-  Logger.log("Removing active livestreams and completed live-like videos over the cutoff; preserving upcoming items");
+  Logger.log("Strict livestream policy: rejecting upcoming, active, and completed broadcast-like videos; column F is ignored");
 
   var filteredVideoIds = [];
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -820,25 +1038,29 @@ function applyFilters(videoIds, sheet, iRow) {
       batch.forEach(function(videoId) {
         var item = itemsById[videoId];
         if (!item) {
-          // Private/deleted videos are commonly omitted from videos.list. They
-          // cannot be inserted, but should not keep a row retrying forever.
-          Logger.log("Skipped unavailable/private video during filtering: " + videoId);
+          recordRowError("filter", "Video " + videoId + " was omitted from a successful metadata response; withholding it for retry");
           return;
         }
 
-        var keep = true;
+        var classification = classifyVideoStrict(item);
+        if (classification == "UNKNOWN") {
+          recordRowError("filter", "Cannot prove video is a normal upload: " + formatVideoEvidence(videoId, item));
+          return;
+        }
+        if (classification != "NORMAL_UPLOAD") {
+          Logger.log("Strict policy rejected " + classification + ": " + formatVideoEvidence(videoId, item));
+          return;
+        }
+
         var duration = item.contentDetails && item.contentDetails.duration;
         if (filterShorts && !duration) {
-          Logger.log("Skipped video with missing duration metadata: " + videoId);
-          keep = false;
+          recordRowError("filter", "Video " + videoId + " has no duration metadata; withholding it for retry");
+          return;
         } else if (filterShorts && isLessThanThreeMinutes(duration)) {
           Logger.log("Filtered short: " + videoId + " | duration: " + duration);
-          keep = false;
+          return;
         }
-        if (keep) {
-          keep = passesLiveLikeFilter(videoId, item, livestreamCutoffSeconds);
-        }
-        if (keep) filteredVideoIds.push(videoId);
+        filteredVideoIds.push(videoId);
       });
     } catch (e) {
       recordRowError(
@@ -851,79 +1073,6 @@ function applyFilters(videoIds, sheet, iRow) {
   }
 
   return filteredVideoIds;
-}
-
-// Column F is the per-row completed-livestream cutoff. It accepts decimal
-// hours (2, 1.5) or a displayed duration (02:30 or 02:30:00). A blank cell
-// uses defaultLivestreamDurationCutoffHours. Invalid values are blocking
-// filter errors so the row checkpoint is retained and the configuration can
-// be corrected without silently losing candidates.
-function getLivestreamDurationCutoffSeconds(sheet, iRow) {
-  var range = sheet.getRange(iRow + 1, reservedColumnLivestreamDurationCutoff + 1);
-  var rawValue = range.getValue();
-  var displayValue = typeof range.getDisplayValue == "function" ? range.getDisplayValue() : "";
-  var rawText = normalizeCellValue(rawValue);
-  var displayText = normalizeCellValue(displayValue);
-
-  if (!rawText && !displayText) return getDefaultLivestreamDurationCutoffSeconds();
-
-  var parsedSeconds = parseLivestreamDurationCutoffSeconds(rawValue, displayValue);
-  if (parsedSeconds !== null) return parsedSeconds;
-
-  recordRowError(
-    "filter",
-    "Invalid livestream duration cutoff in column F: '" + (displayText || rawText) +
-    "'. Enter hours such as 2 or 1.5, or a duration such as 02:30:00. " +
-    "Using the default for this retry."
-  );
-  return getDefaultLivestreamDurationCutoffSeconds();
-}
-
-function getDefaultLivestreamDurationCutoffSeconds() {
-  var hours = Number(defaultLivestreamDurationCutoffHours);
-  if (!isFinite(hours) || hours < 0) hours = 2;
-  return Math.round(hours * 60 * 60);
-}
-
-function parseLivestreamDurationCutoffSeconds(rawValue, displayValue) {
-  var displayText = normalizeCellValue(displayValue);
-  if (displayText.indexOf(":") != -1) {
-    return parseClockDurationSeconds(displayText);
-  }
-
-  if (typeof rawValue == "number") {
-    if (!isFinite(rawValue) || rawValue < 0) return null;
-    return Math.round(rawValue * 60 * 60);
-  }
-
-  var rawText = normalizeCellValue(rawValue);
-  if (rawText.indexOf(":") != -1) return parseClockDurationSeconds(rawText);
-  if (!rawText && !displayText) return getDefaultLivestreamDurationCutoffSeconds();
-
-  var numericText = rawText || displayText;
-  if (!/^\d+(?:[.,]\d+)?$/.test(numericText)) return null;
-  var hours = Number(numericText.replace(",", "."));
-  return isFinite(hours) && hours >= 0 ? Math.round(hours * 60 * 60) : null;
-}
-
-function parseClockDurationSeconds(value) {
-  var parts = normalizeCellValue(value).split(":");
-  if (parts.length != 2 && parts.length != 3) return null;
-  if (!parts.every(function(part) { return /^\d+$/.test(part); })) return null;
-
-  var hours = Number(parts[0]);
-  var minutes = Number(parts[1]);
-  var seconds = parts.length == 3 ? Number(parts[2]) : 0;
-  if (minutes > 59 || seconds > 59) return null;
-  return hours * 60 * 60 + minutes * 60 + seconds;
-}
-
-function formatDurationSeconds(totalSeconds) {
-  totalSeconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
-  var hours = Math.floor(totalSeconds / 3600);
-  var minutes = Math.floor((totalSeconds % 3600) / 60);
-  var seconds = totalSeconds % 60;
-  return hours + ":" + (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
 }
 
 // Checks if an ISO 8601 duration is less or equal than three minutes.
@@ -939,98 +1088,32 @@ function isLessThanThreeMinutes(duration) {
   return duration.match("^PT([12]M|[1-5]?[0-9]S){1,2}$") != null;
 }
 
-// Applies the duration cutoff to videos that the public API marks as live-like.
-// The API does not expose a reliable discriminator between a completed stream
-// and a completed Premiere. Upcoming items are therefore preserved, while a
-// completed live-like item is judged by its observed duration/live window.
-function passesLiveLikeFilter(videoId, item, livestreamCutoffSeconds) {
-  if (!isLiveLikeVideo(item)) return true;
+// Classify only from documented API fields. Duration and title are deliberately
+// excluded: they are not livestream type signals.
+function classifyVideoStrict(item) {
+  if (!item || !item.snippet) return "UNKNOWN";
 
-  var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
-  if (liveBroadcastContent == "upcoming") {
-    Logger.log("Kept upcoming live-like video to preserve possible Premiere: " + videoId);
-    return true;
+  var liveBroadcastContent = normalizeCellValue(item.snippet.liveBroadcastContent).toLowerCase();
+  if (liveBroadcastContent == "upcoming") return "UPCOMING";
+  if (liveBroadcastContent == "live") return "ACTIVE";
+  if (liveBroadcastContent != "none") return "UNKNOWN";
+
+  if (item.liveStreamingDetails !== undefined && item.liveStreamingDetails !== null) {
+    return "COMPLETED_LIVE";
   }
-
-  if (liveBroadcastContent == "live") {
-    Logger.log("Filtered active livestream: " + videoId);
-    return false;
-  }
-
-  var duration = item.contentDetails && item.contentDetails.duration;
-  var durationSeconds = duration ? isoDurationToSeconds(duration) : null;
-  var liveWindowSeconds = getLiveWindowSeconds(item.liveStreamingDetails, liveBroadcastContent);
-  var observedSeconds = null;
-  if (durationSeconds !== null && durationSeconds > 0) observedSeconds = durationSeconds;
-  if (liveWindowSeconds !== null && liveWindowSeconds > 0 &&
-      (observedSeconds === null || liveWindowSeconds > observedSeconds)) {
-    observedSeconds = liveWindowSeconds;
-  }
-
-  if (observedSeconds === null) {
-    recordRowError(
-      "filter",
-      "Cannot determine completed live-like duration for " + videoId + "; withholding it and retaining the row checkpoint for retry"
-    );
-    return false;
-  }
-
-  if (observedSeconds > livestreamCutoffSeconds) {
-    Logger.log(
-      "Filtered completed live-like video over cutoff: " + videoId +
-      " | observed: " + formatDurationSeconds(observedSeconds) +
-      " | cutoff: " + formatDurationSeconds(livestreamCutoffSeconds) +
-      (duration ? " | content duration: " + duration : "") +
-      (liveWindowSeconds !== null ? " | live window seconds: " + liveWindowSeconds : "")
-    );
-    return false;
-  }
-
-  Logger.log(
-    "Kept completed live-like video at or below cutoff: " + videoId +
-    " | observed: " + formatDurationSeconds(observedSeconds) +
-    " | cutoff: " + formatDurationSeconds(livestreamCutoffSeconds)
-  );
-  return true;
+  return "NORMAL_UPLOAD";
 }
 
-// liveBroadcastContent only identifies upcoming/active state. Once a broadcast
-// completes it becomes "none", while liveStreamingDetails remains present.
-function isLiveLikeVideo(item) {
-  var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
-  return !!item.liveStreamingDetails || liveBroadcastContent == "live" || liveBroadcastContent == "upcoming";
-}
-
-// For active livestreams, Youtube may not have a useful final duration yet.
-// Use actualStartTime -> actualEndTime when finished, or actualStartTime -> now when live.
-function getLiveWindowSeconds(liveStreamingDetails, liveBroadcastContent) {
-  if (!liveStreamingDetails || !liveStreamingDetails.actualStartTime) return null;
-
-  var start = new Date(liveStreamingDetails.actualStartTime);
-  if (isNaN(start.getTime())) return null;
-
-  var end = null;
-  if (liveStreamingDetails.actualEndTime) {
-    end = new Date(liveStreamingDetails.actualEndTime);
-  } else if (liveBroadcastContent == "live") {
-    end = new Date();
-  }
-
-  if (!end || isNaN(end.getTime())) return null;
-
-  var seconds = Math.floor((end.getTime() - start.getTime()) / 1000);
-  return seconds >= 0 ? seconds : null;
-}
-
-// Converts Youtube ISO 8601 durations like PT1H23M45S, PT3M, PT2H, or P0D into seconds.
-function isoDurationToSeconds(duration) {
-  var match = String(duration).match(/^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
-  if (!match) return null;
-  var days = Number(match[1] || 0);
-  var hours = Number(match[2] || 0);
-  var minutes = Number(match[3] || 0);
-  var seconds = Number(match[4] || 0);
-  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds);
+function formatVideoEvidence(videoId, item) {
+  var title = item && item.snippet && item.snippet.title ? item.snippet.title : "";
+  var state = item && item.snippet ? normalizeCellValue(item.snippet.liveBroadcastContent) : "missing";
+  var duration = item && item.contentDetails ? normalizeCellValue(item.contentDetails.duration) : "";
+  var hasLiveDetails = !!(item && item.liveStreamingDetails !== undefined && item.liveStreamingDetails !== null);
+  return videoId +
+    (title ? " | title: " + title : "") +
+    " | liveBroadcastContent: " + (state || "missing") +
+    " | liveStreamingDetails: " + (hasLiveDetails ? "present" : "absent") +
+    (duration ? " | duration: " + duration : "");
 }
 
 //

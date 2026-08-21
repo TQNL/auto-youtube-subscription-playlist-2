@@ -8,6 +8,12 @@ This is a Google Apps Script that automatically adds new Youtube videos to playl
 > Premiere/livestream tradeoff is documented in
 > [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md).
 
+The current lab candidate uses a strict, fail-closed rule: upcoming, active, and
+completed broadcast-like videos are rejected regardless of duration. Column F is
+kept only so existing sheets retain their column layout; it is not a livestream
+classifier. See the policy document before deploying if retaining every Premiere
+is more important to you than preventing every detectable livestream.
+
 This is done using Google Sheets for interface, Google Script + Youtube API v3 for executing and scheduling.
 
 [(Older version here)](https://github.com/Elijas/auto-youtube-subscription-playlist)

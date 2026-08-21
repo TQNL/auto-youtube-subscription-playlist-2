@@ -1,52 +1,61 @@
-# Version 4: per-row livestream duration cutoff
+# Version 5 candidate: strict ingestion
 
-## Why the 2:33:33 and 3:33:15 streams were added
+## Hypothesis
 
-The previous reliability-fixed script still treated column F as an exact switch:
+Duration is not a video-type classifier. V5 should prevent livestream leakage by
+admitting only videos whose API metadata positively proves they are ordinary
+uploads. It intentionally accepts false rejection of Premieres rather than false
+acceptance of livestreams.
 
-```js
-var filterLongLiveLike = F4 == "No";
-```
+## Classification
 
-In the supplied sheet, F4 is blank. Therefore `filterLongLiveLike` was false. Since E4 is `No`, the shared filtering function still ran, but it requested only `contentDetails`; it did not request `snippet` or `liveStreamingDetails`, and it never called the live-like filter. The two videos were longer than the shorts threshold, so they survived. Their being 2.5 or 3.5 hours long made no difference because the duration cutoff branch was completely disabled.
+`classifyVideoStrict()` returns one of five states:
 
-## Column F behavior
+- `NORMAL_UPLOAD`: `liveBroadcastContent` is exactly `none` and
+  `liveStreamingDetails` is absent. This is the only admissible state.
+- `UPCOMING`: current broadcast state is `upcoming`.
+- `ACTIVE`: current broadcast state is `live`.
+- `COMPLETED_LIVE`: current state is `none`, but historical
+  `liveStreamingDetails` exists.
+- `UNKNOWN`: required metadata is missing or not recognized.
 
-Column F now directly holds the cutoff for completed live-like videos:
+`UPCOMING`, `ACTIVE`, and `COMPLETED_LIVE` are successful strict-policy
+rejections. `UNKNOWN`, malformed responses, omitted requested IDs, and metadata
+request failures are fail-closed blocking errors: the affected candidates are not
+inserted and the spreadsheet checkpoint is retained.
 
-- `2` means two hours.
-- `1.5` means one hour and thirty minutes.
-- `02:30` or `02:30:00` means two hours and thirty minutes.
-- A blank cell safely defaults to two hours.
-- `0` rejects every completed live-like item with a positive observed duration.
+Column F remains physically reserved so the channel/source columns do not move,
+but it has no effect on livestream classification.
 
-Only completed live-like videos strictly over the cutoff are removed. A video exactly equal to the cutoff is kept. Active livestreams are always removed. Upcoming items are always preserved so scheduled Premieres are not blanket-blocked.
+## Race containment
 
-Old keywords such as `Strict`, `Long`, `Off`, `Yes`, or `No` are no longer accepted in column F. An invalid F value creates a blocking filter error, uses the two-hour fallback for that execution, and withholds the row timestamp so the configuration can be corrected without silently losing retry candidates.
+Candidate metadata is checked during filtering, immediately before insertion, and
+again after insertion. The write budget reserves one rollback operation per insert
+attempt. If the final check is forbidden or unverifiable, the returned playlist
+item ID is used to remove that insertion.
 
-For a Google Sheets duration cell, the code reads the displayed `HH:MM[:SS]` value instead of mistakenly treating the underlying day fraction as hours.
+When a row has more candidates than the safe capacity, V5 inserts a bounded subset
+and retains the checkpoint. A retry reads the target first, de-duplicates successful
+earlier insertions, and continues instead of deadlocking forever.
 
-## Filtering details
+## Existing target contents
 
-The script always requests `snippet,contentDetails,liveStreamingDetails` in one `videos.list` call for each batch of up to 50 IDs. It identifies completed live-like items through `liveStreamingDetails`, because `snippet.liveBroadcastContent` changes to `none` after completion.
+`inspectTargetPlaylistStrict()` is deliberately non-mutating in V5. It paginates
+the whole target, classifies video IDs in batches of 50, logs each non-normal item,
+and emits a structured `STRICT_TARGET_AUDIT_RESULT` summary. Repair is deferred to
+the next version until the real target audit and Premiere replay have been reviewed.
 
-For a completed live-like video, the cutoff uses the greater of:
+## Live experiment gates
 
-- the encoded `contentDetails.duration`; and
-- the `actualStartTime` to `actualEndTime` live window.
+- Row 4: mixed-source replay from a past timestamp.
+- Row 5: known completed Premiere replay from the same window.
+- Source configuration fingerprint must be identical before and after.
+- Both replays run in dry-run mode first; no timestamp or playlist mutation.
+- The target audit is report-only in this version.
 
-This prevents a stream from slipping through when one duration field is slightly shorter or stale. If YouTube marks an item as completed/live-like but supplies no usable duration yet, the video is withheld and the timestamp is retained for retry instead of letting it through.
+## Known limitation
 
-The public API still does not expose a reliable completed-livestream-versus-completed-Premiere discriminator. A completed Premiere longer than the selected cutoff can therefore also be removed. Upcoming items remain preserved.
-
-Replacing the code does not delete streams already present in a playlist; remove the shown existing entries manually.
-
-Official references:
-
-- [YouTube video resource](https://developers.google.com/youtube/v3/docs/videos)
-- [Videos: list](https://developers.google.com/youtube/v3/docs/videos/list)
-- [LiveBroadcasts resource](https://developers.google.com/youtube/v3/live/docs/liveBroadcasts)
-
-## Verification
-
-Fourteen regression tests pass. They cover the shown 2:33:33 and 3:33:15 archives, blank/default and numeric cutoffs, Google Sheets duration values, upcoming items, active streams, exact-cutoff behavior, long normal uploads, unresolved live metadata, one metadata request per 50 IDs, source/read isolation, timestamp safety, write-budget safety, and deletion pagination.
+The public `videos.list` schema has no documented discriminator that guarantees a
+completed broadcast was a Premiere rather than an encoder livestream. Strict V5
+therefore rejects a Premiere whenever YouTube exposes a broadcast marker. This is
+the intended safety tradeoff.

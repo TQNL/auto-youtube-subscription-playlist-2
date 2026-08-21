@@ -128,32 +128,58 @@ function testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp() {
 }
 
 function testTransientSourceErrorStillBlocksCheckpoint() {
+  const inserted = [];
   let timestampWrites = 0;
   const ctx = makeContext({
-    PlaylistItems: {
+    Channels: {
       list() {
-        const error = new Error('temporary backend failure');
-        error.details = {code: 503, errors: [{reason: 'backendError'}]};
-        throw error;
+        return {items: [{contentDetails: {relatedPlaylists: {uploads: 'UU_HEALTHY'}}}]};
+      }
+    },
+    PlaylistItems: {
+      list(part, options) {
+        if (options.playlistId === 'UU_HEALTHY') {
+          return {items: [{contentDetails: {videoId: 'healthy-video', videoPublishedAt: '2026-07-21T08:00:00Z'}}]};
+        }
+        if (options.playlistId === 'PL_TRANSIENT_12345') {
+          const error = new Error('temporary backend failure');
+          error.details = {code: 503, errors: [{reason: 'backendError'}]};
+          throw error;
+        }
+        if (options.playlistId === 'PL_TARGET_12345') return {items: []};
+        throw new Error('unexpected playlist lookup ' + options.playlistId + ' / ' + part);
+      },
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'inserted-healthy-video'};
+      }
+    },
+    Videos: {
+      list(part, options) {
+        return {items: options.id.split(',').map(id => normalUpload(id, 'PT10M'))};
       }
     }
   });
   const sheet = {
-    getLastColumn: () => 7,
+    getLastColumn: () => 8,
     getRange(row, column) {
       return {
-        getValue: () => (column === 5 || column === 6 ? 'Yes' : ''),
+        getValue: () => (column === 5 ? 'Yes' : ''),
         setValue: () => { timestampWrites += 1; }
       };
     }
   };
   const data = [[], [], [], [
-    'PL_TARGET_12345', '2026-07-20T00:00:00Z', 0, 0, 'Yes', 'Yes', 'PL_TRANSIENT_12345'
+    'PL_TARGET_12345', '2026-07-20T00:00:00Z', 0, 0, 'Yes', '',
+    'UC_HEALTHY_12345', 'PL_TRANSIENT_12345'
   ]];
 
   ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {};
+  ctx.playlistWriteOperationsUsed = 0;
   ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
 
+  assert.deepStrictEqual(inserted, ['healthy-video'], 'healthy candidates must survive a transient failure in another source');
   assert.strictEqual(ctx.currentRowStatus.sourceErrors, 1);
   assert.strictEqual(ctx.currentRowStatus.sourceWarnings, 0);
   assert.strictEqual(timestampWrites, 0, 'transient source failures must retain the retry checkpoint');
@@ -192,232 +218,215 @@ function testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint() {
   assert.strictEqual(timestampWrites, 1, 'independent cleanup failures must not freeze ingestion');
   assert.strictEqual(ctx.currentRowStatus.timestampUpdated, true);
 }
-function testFilterMetadataIsBatchedAndUpcomingIsKept() {
-  const ids = Array.from({length: 50}, (_, i) => 'video-' + i);
+function normalUpload(id, duration) {
+  return {
+    id,
+    snippet: {liveBroadcastContent: 'none'},
+    contentDetails: {duration: duration || 'PT10M'}
+  };
+}
+
+function strictFilterSheet(shortsSetting) {
+  return {
+    getRange(row, column) {
+      assert.strictEqual(column, 5, 'strict ingestion must not consult the column-F duration heuristic');
+      return {getValue: () => shortsSetting || 'Yes'};
+    }
+  };
+}
+
+function testStrictClassificationOracle() {
+  const ctx = makeContext();
+  assert.strictEqual(
+    ctx.classifyVideoStrict(normalUpload('long-upload', 'PT12H')),
+    'NORMAL_UPLOAD',
+    'duration alone must never turn an ordinary upload into a livestream'
+  );
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'scheduled',
+    snippet: {liveBroadcastContent: 'upcoming'},
+    contentDetails: {duration: 'P0D'},
+    liveStreamingDetails: {scheduledStartTime: '2026-08-23T16:00:00Z'}
+  }), 'UPCOMING');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'live-now',
+    snippet: {liveBroadcastContent: 'live'},
+    contentDetails: {duration: 'P0D'},
+    liveStreamingDetails: {actualStartTime: '2026-08-21T18:00:00Z'}
+  }), 'ACTIVE');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'short-archive',
+    snippet: {liveBroadcastContent: 'none'},
+    contentDetails: {duration: 'PT12M'},
+    liveStreamingDetails: {
+      actualStartTime: '2026-08-20T18:00:00Z',
+      actualEndTime: '2026-08-20T18:12:00Z'
+    }
+  }), 'COMPLETED_LIVE');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'long-archive',
+    snippet: {liveBroadcastContent: 'none'},
+    contentDetails: {duration: 'PT6H9M41S'},
+    liveStreamingDetails: {
+      actualStartTime: '2026-08-17T10:00:00Z',
+      actualEndTime: '2026-08-17T16:09:41Z'
+    }
+  }), 'COMPLETED_LIVE');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'empty-live-details',
+    snippet: {liveBroadcastContent: 'none'},
+    contentDetails: {duration: 'PT59M12S'},
+    liveStreamingDetails: {}
+  }), 'COMPLETED_LIVE', 'presence of even an empty liveStreamingDetails object is a broadcast marker');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'malformed-state',
+    snippet: {liveBroadcastContent: 'premiere-ish'},
+    contentDetails: {duration: 'PT20M'}
+  }), 'UNKNOWN');
+  assert.strictEqual(ctx.classifyVideoStrict({
+    id: 'missing-state',
+    snippet: {},
+    contentDetails: {duration: 'PT20M'}
+  }), 'UNKNOWN');
+}
+
+function testStrictFilterKeepsOnlyNormalUploads() {
+  const ids = [
+    'long-upload',
+    'scheduled',
+    'live-now',
+    'short-archive',
+    'long-archive',
+    'empty-live-details'
+  ];
+  let requestedPart = '';
   let listCalls = 0;
   const ctx = makeContext({
     Videos: {
       list(part, options) {
+        requestedPart = part;
         listCalls += 1;
-        assert.strictEqual(options.id.split(',').length, 50);
-        return {items: ids.map((id, index) => {
-          if (index === 0) return {id, snippet: {liveBroadcastContent: 'none'}, contentDetails: {duration: 'PT2M'}};
-          if (index === 1) return {
-            id,
-            snippet: {liveBroadcastContent: 'live'},
-            contentDetails: {duration: 'PT3H'},
-            liveStreamingDetails: {actualStartTime: '2026-07-18T00:00:00Z'}
-          };
-          if (index === 2) return {
-            id,
+        assert.deepStrictEqual(options.id.split(','), ids);
+        return {items: [
+          normalUpload(ids[0], 'PT12H'),
+          {
+            id: ids[1],
             snippet: {liveBroadcastContent: 'upcoming'},
             contentDetails: {duration: 'P0D'},
-            liveStreamingDetails: {scheduledStartTime: '2026-07-19T00:00:00Z'}
-          };
-          if (index === 3) return {
-            id,
-            snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT3H'},
-            liveStreamingDetails: {
-              actualStartTime: '2026-07-17T00:00:00Z',
-              actualEndTime: '2026-07-17T03:00:01Z'
-            }
-          };
-          return {id, snippet: {liveBroadcastContent: 'none'}, contentDetails: {duration: 'PT10M'}};
-        })};
-      }
-    }
-  });
-  const sheet = {
-    getRange(row, column) {
-      return {
-        getValue: () => (column === 5 ? 'No' : 2),
-        getDisplayValue: () => (column === 6 ? '2' : '')
-      };
-    }
-  };
-  ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(ids, sheet, 3));
-
-  assert.strictEqual(listCalls, 1, '50 videos should require one videos.list call');
-  assert.strictEqual(result.length, 47);
-  assert.ok(result.includes('video-2'), 'upcoming premiere candidate must remain eligible');
-  assert.ok(!result.includes('video-0'));
-  assert.ok(!result.includes('video-1'));
-  assert.ok(!result.includes('video-3'));
-}
-
-function testBlankCutoffDefaultsToTwoHoursAndRejectsLongArchives() {
-  let requestedPart = '';
-  const ctx = makeContext({
-    Videos: {
-      list(part) {
-        requestedPart = part;
-        return {items: [
+            liveStreamingDetails: {scheduledStartTime: '2026-08-23T16:00:00Z'}
+          },
           {
-            id: 'ashswag-stream',
+            id: ids[2],
+            snippet: {liveBroadcastContent: 'live'},
+            contentDetails: {duration: 'P0D'},
+            liveStreamingDetails: {actualStartTime: '2026-08-21T18:00:00Z'}
+          },
+          {
+            id: ids[3],
             snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT2H33M33S'},
+            contentDetails: {duration: 'PT12M'},
             liveStreamingDetails: {
-              actualStartTime: '2026-08-01T18:00:00Z',
-              actualEndTime: '2026-08-01T20:33:33Z'
+              actualStartTime: '2026-08-20T18:00:00Z',
+              actualEndTime: '2026-08-20T18:12:00Z'
             }
           },
           {
-            id: 'midnight-stream',
+            id: ids[4],
             snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT3H33M15S'},
+            contentDetails: {duration: 'PT6H9M41S'},
             liveStreamingDetails: {
-              actualStartTime: '2026-08-01T18:00:00Z',
-              actualEndTime: '2026-08-01T21:33:15Z'
+              actualStartTime: '2026-08-17T10:00:00Z',
+              actualEndTime: '2026-08-17T16:09:41Z'
             }
+          },
+          {
+            id: ids[5],
+            snippet: {liveBroadcastContent: 'none'},
+            contentDetails: {duration: 'PT59M12S'},
+            liveStreamingDetails: {}
           }
         ]};
       }
     }
   });
-  const sheet = {
-    getRange(row, column) {
-      return {getValue: () => (column === 5 ? 'Yes' : ''), getDisplayValue: () => ''};
-    }
-  };
   ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(['ashswag-stream', 'midnight-stream'], sheet, 3));
+  const result = Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3));
 
-  assert.deepStrictEqual(result, []);
+  assert.deepStrictEqual(result, ['long-upload']);
+  assert.strictEqual(listCalls, 1);
+  assert.ok(requestedPart.includes('snippet'));
+  assert.ok(requestedPart.includes('contentDetails'));
   assert.ok(requestedPart.includes('liveStreamingDetails'));
-  assert.ok(ctx.__logs.some(line => line.includes('Completed-livestream duration cutoff: 2:00:00')));
-  assert.ok(ctx.__logs.some(line => line.includes('PT2H33M33S')));
-  assert.ok(ctx.__logs.some(line => line.includes('PT3H33M15S')));
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0, 'known broadcast classes are policy rejections, not read failures');
 }
 
-function testNumericThreeHourCutoffKeepsTwoAndAHalfHourArchive() {
-  const ctx = makeContext({
-    Videos: {
-      list() {
-        return {items: [{
-          id: 'ashswag-stream',
-          snippet: {liveBroadcastContent: 'none'},
-          contentDetails: {duration: 'PT2H33M33S'},
-          liveStreamingDetails: {
-            actualStartTime: '2026-08-03T18:00:00Z',
-            actualEndTime: '2026-08-03T20:33:33Z'
-          }
-        }]};
-      }
-    }
-  });
-  const sheet = {
-    getRange(row, column) {
-      return {
-        getValue: () => (column === 5 ? 'Yes' : 3),
-        getDisplayValue: () => (column === 6 ? '3' : '')
-      };
-    }
-  };
-  ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(['ashswag-stream'], sheet, 3));
-
-  assert.deepStrictEqual(result, ['ashswag-stream']);
-  assert.ok(ctx.__logs.some(line => line.includes('cutoff: 3:00:00')));
-}
-
-function testSheetDurationDisplayIsParsedAsDurationNotDayFraction() {
-  const ctx = makeContext();
-  const sheet = {
-    getRange() {
-      return {
-        getValue: () => 2.5 / 24,
-        getDisplayValue: () => '02:30:00'
-      };
-    }
-  };
-  ctx.currentRowStatus = ctx.createRowStatus();
-  assert.strictEqual(ctx.getLivestreamDurationCutoffSeconds(sheet, 3), 9000);
-}
-
-function testInvalidCutoffBlocksCheckpointAndUsesSafeDefault() {
-  const ctx = makeContext();
-  const sheet = {
-    getRange() {
-      return {getValue: () => 'two-ish', getDisplayValue: () => 'two-ish'};
-    }
-  };
-  ctx.currentRowStatus = ctx.createRowStatus();
-  assert.strictEqual(ctx.getLivestreamDurationCutoffSeconds(sheet, 3), 7200);
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, 1);
-  assert.strictEqual(ctx.currentRowStatus.errorCount, 1);
-}
-
-function testCutoffUsesLongestObservedLiveDurationAndLeavesRegularUploadsAlone() {
-  const ids = ['regular-long-video', 'exactly-two-hour-stream', 'longer-live-window'];
+function testUnknownMetadataIsFailClosedAndBlocksCheckpoint() {
+  const ids = ['malformed-state', 'missing-state'];
   const ctx = makeContext({
     Videos: {
       list() {
         return {items: [
           {
             id: ids[0],
-            snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT4H'}
+            snippet: {liveBroadcastContent: 'premiere-ish'},
+            contentDetails: {duration: 'PT20M'}
           },
           {
             id: ids[1],
-            snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT2H'},
-            liveStreamingDetails: {
-              actualStartTime: '2026-08-01T18:00:00Z',
-              actualEndTime: '2026-08-01T20:00:00Z'
-            }
-          },
-          {
-            id: ids[2],
-            snippet: {liveBroadcastContent: 'none'},
-            contentDetails: {duration: 'PT1H59M'},
-            liveStreamingDetails: {
-              actualStartTime: '2026-08-01T18:00:00Z',
-              actualEndTime: '2026-08-01T20:00:01Z'
-            }
+            snippet: {},
+            contentDetails: {duration: 'PT20M'}
           }
         ]};
       }
     }
   });
-  const sheet = {
-    getRange(row, column) {
-      return {
-        getValue: () => (column === 5 ? 'Yes' : 2),
-        getDisplayValue: () => (column === 6 ? '2' : '')
-      };
-    }
-  };
   ctx.currentRowStatus = ctx.createRowStatus();
-  assert.deepStrictEqual(Array.from(ctx.applyFilters(ids, sheet, 3)), [ids[0], ids[1]]);
+
+  assert.deepStrictEqual(Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3)), []);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 2);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 2);
 }
 
-function testUnknownCompletedLiveDurationIsRetriedInsteadOfSlippingThrough() {
+function testSuccessfulMetadataResponseOmissionIsWithheld() {
   const ctx = makeContext({
     Videos: {
       list() {
-        return {items: [{
-          id: 'processing-stream',
-          snippet: {liveBroadcastContent: 'none'},
-          contentDetails: {duration: 'P0D'},
-          liveStreamingDetails: {actualStartTime: '2026-08-01T18:00:00Z'}
-        }]};
+        return {items: [normalUpload('returned-upload', 'PT20M')]};
       }
     }
   });
-  const sheet = {
-    getRange(row, column) {
-      return {
-        getValue: () => (column === 5 ? 'Yes' : 2),
-        getDisplayValue: () => (column === 6 ? '2' : '')
-      };
-    }
-  };
   ctx.currentRowStatus = ctx.createRowStatus();
-  assert.deepStrictEqual(Array.from(ctx.applyFilters(['processing-stream'], sheet, 3)), []);
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, 1);
+
+  const result = Array.from(ctx.applyFilters(
+    ['returned-upload', 'omitted-video'],
+    strictFilterSheet('Yes'),
+    3
+  ));
+
+  assert.deepStrictEqual(result, ['returned-upload']);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 1, 'an omitted requested ID must retain the retry checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1);
+  assert.ok(ctx.__logs.some(line => line.includes('omitted-video')));
+}
+
+function testStrictShortFilterRemainsIndependent() {
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [
+          normalUpload('ordinary-short', 'PT2M'),
+          normalUpload('ordinary-video', 'PT10M')
+        ]};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  assert.deepStrictEqual(
+    Array.from(ctx.applyFilters(['ordinary-short', 'ordinary-video'], strictFilterSheet('No'), 3)),
+    ['ordinary-video']
+  );
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
 }
 
 function testFilterBatchFailureDoesNotCancelLaterBatch() {
@@ -428,41 +437,260 @@ function testFilterBatchFailureDoesNotCancelLaterBatch() {
       list(part, options) {
         call += 1;
         if (call === 1) throw new Error('temporary metadata failure');
-        return {items: options.id.split(',').map(id => ({
-          id,
-          snippet: {liveBroadcastContent: 'none'},
-          contentDetails: {duration: 'PT10M'}
-        }))};
+        return {items: options.id.split(',').map(id => normalUpload(id, 'PT10M'))};
       }
     }
   });
-  const sheet = {
-    getRange(row, column) {
-      return {
-        getValue: () => (column === 5 ? 'No' : 2),
-        getDisplayValue: () => (column === 6 ? '2' : '')
-      };
-    }
-  };
   ctx.currentRowStatus = ctx.createRowStatus();
-  const result = Array.from(ctx.applyFilters(ids, sheet, 3));
+  const result = Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3));
 
   assert.strictEqual(call, 2);
   assert.strictEqual(result.length, 50);
   assert.strictEqual(result[0], 'video-50');
   assert.strictEqual(ctx.currentRowStatus.filterErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1);
 }
 
-function testWriteBudgetRefusesPartialRow() {
+function testVideoMetadataUsesOneRequestPerFiftyIds() {
+  const ids = Array.from({length: 101}, (_, i) => 'video-' + i);
+  const batchSizes = [];
+  const ctx = makeContext({
+    Videos: {
+      list(part, options) {
+        const batch = options.id.split(',');
+        batchSizes.push(batch.length);
+        return {items: batch.map(id => normalUpload(id, 'PT10M'))};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const result = Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3));
+
+  assert.deepStrictEqual(batchSizes, [50, 50, 1]);
+  assert.deepStrictEqual(result, ids);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
+}
+
+function testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates() {
+  const ids = Array.from({length: 55}, (_, i) => 'audit-video-' + i);
+  const playlistPageTokens = [];
+  const metadataBatchSizes = [];
+  let removeCalls = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list(part, options) {
+        playlistPageTokens.push(options.pageToken);
+        if (!options.pageToken) {
+          return {
+            nextPageToken: 'audit-page-2',
+            items: ids.slice(0, 50).map((id, index) => ({
+              id: 'playlist-item-' + index,
+              contentDetails: {videoId: id}
+            }))
+          };
+        }
+        assert.strictEqual(options.pageToken, 'audit-page-2');
+        return {items: ids.slice(50).map((id, index) => ({
+          id: 'playlist-item-' + (index + 50),
+          contentDetails: {videoId: id}
+        })).concat([{
+          id: 'duplicate-playlist-item',
+          contentDetails: {videoId: ids[0]}
+        }])};
+      },
+      remove() { removeCalls += 1; }
+    },
+    Videos: {
+      list(part, options) {
+        const batch = options.id.split(',');
+        metadataBatchSizes.push(batch.length);
+        return {items: batch.map(id => {
+          if (id === ids[51]) {
+            return {
+              id,
+              snippet: {liveBroadcastContent: 'upcoming'},
+              contentDetails: {duration: 'P0D'},
+              liveStreamingDetails: {scheduledStartTime: '2026-08-23T16:00:00Z'}
+            };
+          }
+          if (id === ids[52]) {
+            return {
+              id,
+              snippet: {liveBroadcastContent: 'live'},
+              contentDetails: {duration: 'P0D'},
+              liveStreamingDetails: {actualStartTime: '2026-08-21T18:00:00Z'}
+            };
+          }
+          if (id === ids[53]) {
+            return {
+              id,
+              snippet: {liveBroadcastContent: 'none'},
+              contentDetails: {duration: 'PT6H'},
+              liveStreamingDetails: {
+                actualStartTime: '2026-08-20T10:00:00Z',
+                actualEndTime: '2026-08-20T16:00:00Z'
+              }
+            };
+          }
+          if (id === ids[54]) {
+            return {
+              id,
+              snippet: {liveBroadcastContent: 'unexpected-state'},
+              contentDetails: {duration: 'PT20M'}
+            };
+          }
+          return normalUpload(id, 'PT20M');
+        })};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const report = JSON.parse(JSON.stringify(ctx.inspectTargetPlaylistStrict('PL_TARGET')));
+
+  assert.deepStrictEqual(playlistPageTokens, ['', 'audit-page-2']);
+  assert.deepStrictEqual(metadataBatchSizes, [50, 5]);
+  assert.strictEqual(report.playlistItemCount, 56);
+  assert.strictEqual(report.uniqueVideoCount, 55);
+  assert.deepStrictEqual(report.classifications, {
+    NORMAL_UPLOAD: 51,
+    UPCOMING: 1,
+    ACTIVE: 1,
+    COMPLETED_LIVE: 1,
+    UNKNOWN: 1
+  });
+  assert.strictEqual(report.forbiddenCount, 3);
+  assert.strictEqual(report.unknownCount, 1);
+  assert.strictEqual(report.mutationPerformed, false);
+  assert.strictEqual(removeCalls, 0, 'v5 target audit must remain inspect-only');
+}
+
+function testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking() {
+  const ids = Array.from({length: 60}, (_, i) => 'audit-failure-video-' + i);
+  const metadataBatchSizes = [];
+  let removeCalls = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        return {items: ids.map((id, index) => ({
+          id: 'playlist-item-' + index,
+          contentDetails: {videoId: id}
+        }))};
+      },
+      remove() { removeCalls += 1; }
+    },
+    Videos: {
+      list(part, options) {
+        const batch = options.id.split(',');
+        metadataBatchSizes.push(batch.length);
+        if (metadataBatchSizes.length === 2) throw new Error('temporary audit metadata failure');
+        return {items: batch.map(id => normalUpload(id, 'PT20M'))};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const report = JSON.parse(JSON.stringify(ctx.inspectTargetPlaylistStrict('PL_TARGET')));
+
+  assert.deepStrictEqual(metadataBatchSizes, [50, 10]);
+  assert.strictEqual(report.classifications.NORMAL_UPLOAD, 50);
+  assert.strictEqual(report.classifications.UNKNOWN, 10);
+  assert.strictEqual(report.unknownCount, 10);
+  assert.strictEqual(report.mutationPerformed, false);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1, 'audit read failure must block the checkpoint');
+  assert.strictEqual(removeCalls, 0, 'even a failed v5 audit must not mutate the playlist');
+}
+
+function testPreInsertRevalidationRejectsStateTransition() {
   let insertCalls = 0;
-  const ctx = makeContext({PlaylistItems: {insert: () => { insertCalls += 1; }}});
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [{
+          id: 'changed-before-insert',
+          snippet: {liveBroadcastContent: 'upcoming'},
+          contentDetails: {duration: 'P0D'},
+          liveStreamingDetails: {scheduledStartTime: '2026-08-22T16:00:00Z'}
+        }]};
+      }
+    },
+    PlaylistItems: {
+      insert() { insertCalls += 1; }
+    }
+  });
   ctx.currentRowStatus = ctx.createRowStatus();
   ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
-  ctx.maxPlaylistWriteOperationsPerRun = 2;
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['changed-before-insert']);
+
+  assert.strictEqual(insertCalls, 0, 'a candidate that becomes upcoming before insertion must never be written');
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
+  assert.ok(ctx.__logs.some(line => line.includes('pre-insert') && line.includes('UPCOMING')));
+}
+
+function testPostInsertTransitionIsRolledBack() {
+  let metadataCall = 0;
+  const inserted = [];
+  const removed = [];
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        metadataCall += 1;
+        if (metadataCall === 1) {
+          return {items: [normalUpload('changed-after-insert', 'PT20M')]};
+        }
+        return {items: [{
+          id: 'changed-after-insert',
+          snippet: {liveBroadcastContent: 'live'},
+          contentDetails: {duration: 'P0D'},
+          liveStreamingDetails: {actualStartTime: '2026-08-21T20:00:00Z'}
+        }]};
+      }
+    },
+    PlaylistItems: {
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'playlist-item-1'};
+      },
+      remove(playlistItemId) { removed.push(playlistItemId); }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['changed-after-insert']);
+
+  assert.deepStrictEqual(inserted, ['changed-after-insert']);
+  assert.deepStrictEqual(removed, ['playlist-item-1']);
+  assert.strictEqual(metadataCall, 2, 'the inserted item must be checked both before and after insertion');
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
+  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
+  assert.strictEqual(ctx.targetPlaylistVideoCache.PL_TARGET['changed-after-insert'], undefined);
+}
+
+function testWriteBudgetRequiresRollbackCapacity() {
+  let insertCalls = 0;
+  const ctx = makeContext({
+    Videos: {
+      list(part, options) {
+        return {items: options.id.split(',').map(id => normalUpload(id, 'PT10M'))};
+      }
+    },
+    PlaylistItems: {insert: () => { insertCalls += 1; }}
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 1;
   ctx.playlistWriteOperationsUsed = 0;
 
   ctx.addVideosToPlaylist('PL_TARGET', ['a', 'b', 'c']);
-  assert.strictEqual(insertCalls, 0);
+  assert.strictEqual(insertCalls, 0, 'one remaining write is unsafe because no rollback write can be reserved');
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
   assert.strictEqual(ctx.currentRowStatus.writeErrors, 1);
 }
@@ -508,19 +736,34 @@ const tests = [
   testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp,
   testTransientSourceErrorStillBlocksCheckpoint,
   testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
-  testFilterMetadataIsBatchedAndUpcomingIsKept,
-  testBlankCutoffDefaultsToTwoHoursAndRejectsLongArchives,
-  testNumericThreeHourCutoffKeepsTwoAndAHalfHourArchive,
-  testSheetDurationDisplayIsParsedAsDurationNotDayFraction,
-  testInvalidCutoffBlocksCheckpointAndUsesSafeDefault,
-  testCutoffUsesLongestObservedLiveDurationAndLeavesRegularUploadsAlone,
-  testUnknownCompletedLiveDurationIsRetriedInsteadOfSlippingThrough,
+  testStrictClassificationOracle,
+  testStrictFilterKeepsOnlyNormalUploads,
+  testUnknownMetadataIsFailClosedAndBlocksCheckpoint,
+  testSuccessfulMetadataResponseOmissionIsWithheld,
+  testStrictShortFilterRemainsIndependent,
   testFilterBatchFailureDoesNotCancelLaterBatch,
-  testWriteBudgetRefusesPartialRow,
+  testVideoMetadataUsesOneRequestPerFiftyIds,
+  testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates,
+  testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking,
+  testPreInsertRevalidationRejectsStateTransition,
+  testPostInsertTransitionIsRolledBack,
+  testWriteBudgetRequiresRollbackCapacity,
   testDeletionReadsAllPagesBeforeMutation
 ];
+const failures = [];
 for (const test of tests) {
-  test();
-  console.log('PASS', test.name);
+  try {
+    test();
+    console.log('PASS', test.name);
+  } catch (error) {
+    failures.push({test: test.name, error});
+    console.error('FAIL', test.name);
+    console.error(error && error.stack ? error.stack : error);
+  }
 }
-console.log(`PASS ${tests.length} tests`);
+if (failures.length) {
+  console.error(`FAIL ${failures.length} of ${tests.length} tests`);
+  process.exitCode = 1;
+} else {
+  console.log(`PASS ${tests.length} tests`);
+}
