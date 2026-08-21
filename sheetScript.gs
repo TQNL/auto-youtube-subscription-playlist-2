@@ -5,7 +5,7 @@
 // https://docs.google.com/spreadsheets/d/1sZ9U52iuws6ijWPQTmQkXvaZSV3dZ3W9JzhnhNTX9GU/copy
 
 // Adjustable to quota of Youtube API
-var maxVideos = 200;
+var maxVideos = 8000;
 
 // Errorflags
 var errorflag = false;
@@ -26,6 +26,7 @@ var reservedColumnTimestamp = 1;    // Column containing last timestamp
 var reservedColumnFrequency = 2;    // Column containing number of hours until new check
 var reservedColumnDeleteDays = 3;   // Column containing number of days before today until videos get deleted
 var reservedColumnShortsFilter = 4; // Column containing switch for using shorts filter
+var reservedColumnLongVideosFilter = 5; // Column containing switch for filtering out livestreams/premieres over 2 hours
 // Reserved lengths
 var reservedDebugNumRows = 900;   // Number of rows to use in a column before moving on to the next column in debug sheet
 var reservedDebugNumColumns = 26; // Number of columns to use in debug sheet, must be at least 4 to allow infinite cycle
@@ -573,6 +574,12 @@ function applyFilters(videoIds, sheet, iRow) {
     Logger.log("Removing shorts");
     filters.push(removeShortsFilter);
   }
+  // Removes active livestreams and livestreams/premieres longer than 2 hours if enabled
+  // Normal uploaded videos over 2 hours are kept.
+  if (sheet.getRange(iRow + 1, reservedColumnLongVideosFilter + 1).getValue() == "No") {
+    Logger.log("Removing active livestreams and livestreams/premieres over 2 hours");
+    filters.push(removeOverTwoHoursLiveLikeFilter);
+  }
   return videoIds.filter(videoId => filters.reduce((acc, cur) => acc && cur(videoId), true));
 }
 
@@ -598,6 +605,88 @@ function isLessThanThreeMinutes(duration) {
   if (duration.slice(0,2) != "PT") return false;
   // match one or two groups of this, so e.g. "2M", "59S" or "2M5S"
   return duration.match("^PT([12]M|[1-5]?[0-9]S){1,2}$") != null;
+}
+
+// Returns false if an active livestream is found, or if a livestream/premiere-like video is longer than two hours.
+// Normal uploaded videos over two hours are kept.
+// This assumes finished premieres are normally under two hours, so long live-like videos are treated as livestream/VOD content.
+function removeOverTwoHoursLiveLikeFilter(videoId) {
+  let response = YouTube.Videos.list('snippet,contentDetails,liveStreamingDetails', {
+    id: videoId,
+  });
+  if (!(response.items && response.items.length)) return false;
+
+  var item = response.items[0];
+  if (!isLiveLikeVideo(item)) return true;
+
+  var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
+  if (liveBroadcastContent == "live") {
+    Logger.log("Filtered active livestream: " + videoId);
+    return false;
+  }
+
+  var duration = item.contentDetails && item.contentDetails.duration;
+  if (duration && isOverTwoHours(duration)) {
+    Logger.log("Filtered live-like video over 2 hours: " + videoId + " | duration: " + duration);
+    return false;
+  }
+
+  // Active livestreams can report a zero/unfinished duration while they are still live.
+  // In that case, use the live window if it is available.
+  var liveWindowSeconds = getLiveWindowSeconds(item.liveStreamingDetails, liveBroadcastContent);
+  if (liveWindowSeconds !== null && liveWindowSeconds > 2 * 60 * 60) {
+    Logger.log("Filtered active live-like video over 2 hours: " + videoId + " | live window seconds: " + liveWindowSeconds);
+    return false;
+  }
+
+  return true;
+}
+
+// Returns true when Youtube exposes this item as livestream/premiere-like.
+// Finished premieres and finished livestream VODs can both have liveStreamingDetails,
+// so this helper intentionally does not try to separate them directly.
+function isLiveLikeVideo(item) {
+  var liveBroadcastContent = item.snippet && item.snippet.liveBroadcastContent;
+  return !!item.liveStreamingDetails || liveBroadcastContent == "live" || liveBroadcastContent == "upcoming";
+}
+
+// For active livestreams, Youtube may not have a useful final duration yet.
+// Use actualStartTime -> actualEndTime when finished, or actualStartTime -> now when live.
+function getLiveWindowSeconds(liveStreamingDetails, liveBroadcastContent) {
+  if (!liveStreamingDetails || !liveStreamingDetails.actualStartTime) return null;
+
+  var start = new Date(liveStreamingDetails.actualStartTime);
+  if (isNaN(start.getTime())) return null;
+
+  var end = null;
+  if (liveStreamingDetails.actualEndTime) {
+    end = new Date(liveStreamingDetails.actualEndTime);
+  } else if (liveBroadcastContent == "live") {
+    end = new Date();
+  }
+
+  if (!end || isNaN(end.getTime())) return null;
+
+  var seconds = Math.floor((end.getTime() - start.getTime()) / 1000);
+  return seconds >= 0 ? seconds : null;
+}
+
+// Checks if an ISO 8601 duration is strictly longer than two hours.
+// Exactly 2:00:00 is allowed. Change > to >= if you also want to block exactly two-hour videos.
+function isOverTwoHours(duration) {
+  var seconds = isoDurationToSeconds(duration);
+  return seconds !== null && seconds > 2 * 60 * 60;
+}
+
+// Converts Youtube ISO 8601 durations like PT1H23M45S, PT3M, PT2H, or P0D into seconds.
+function isoDurationToSeconds(duration) {
+  var match = String(duration).match(/^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (!match) return null;
+  var days = Number(match[1] || 0);
+  var hours = Number(match[2] || 0);
+  var minutes = Number(match[3] || 0);
+  var seconds = Number(match[4] || 0);
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds);
 }
 
 //
