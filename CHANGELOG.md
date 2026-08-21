@@ -24,7 +24,58 @@ for the independent short-video rule.
 
 - `v5-strict-ingestion.gs` — fail-closed candidate classification, pre/post
   insertion revalidation with reserved rollback capacity, and non-mutating
-  replay/target-audit tooling. Live validation is pending.
-- `v6-strict-repair.gs` — planned target-playlist revalidation and repair after
-  the v5 dry-run evidence is reviewed.
+  replay/target-audit tooling. The first production attempt exposed a separate
+  deep target-pagination failure, so this snapshot was not promoted by itself.
+- `v5.1-target-pagination-resilience.gs` — retains the strict classifier and adds
+  partial target inventory plus exact per-candidate membership probes. It never
+  treats a generic HTTP 409 as proof of a duplicate. Live production replay added
+  41 normal uploads; an identical replay added 0 and skipped all 41. Both rows
+  advanced their checkpoints without changing source configuration. See the
+  [live-validation record](./docs/LIVE_VALIDATION_2026-08-21.md).
+- V5.2 made every channel-derived uploads-playlist read failure blocking. Its
+  2026-08-22 live run proved that strict classification still rejected upcoming,
+  active, and completed broadcasts, but two first-page `playlistNotFound` errors
+  unnecessarily froze row 4's checkpoint. Row 5 still ran and rejected the known
+  Premiere, confirming that a failed row does not break the outer row loop. V5.2
+  was a transient diagnostic revision and was superseded directly by the archived
+  V5.3 candidate rather than retained as a separate source snapshot.
+- `v5.3-source-page-liveness.gs` — the current `sheetScript.gs` candidate. Source
+  failures are page-aware: a permanently missing playlist on the first source
+  page is a warning, while every later-page source failure is blocking and keeps
+  candidates already read. Target and metadata-filter 404s are never downgraded
+  by this rule. A first-page 404 does not prove a source is empty, so this is an
+  explicit liveness tradeoff; lossless handling would require per-source
+  checkpoints or persistent disabled-source state.
+- Per-row processing and error accounting no longer depend on the auxiliary
+  `DebugData` sheet. Row-log, execution-summary, or debug-viewer persistence
+  failures are logged best-effort and cannot stop later playlist rows or replace
+  the real aggregate result. Failed row logs are re-emitted in bounded execution-
+  log chunks so a later `Logger.clear()` cannot erase the only useful evidence.
+- Logging itself is non-throwing and backed by an in-memory row buffer, so a
+  Logger failure cannot interrupt post-insert validation or mandatory rollback.
+- Partial-target membership probes now have an execution-wide ceiling tied to
+  rollback-safe write capacity. Quota exhaustion is latched so later rows do not
+  repeat the same exact probes; resolved candidates may continue, while every
+  unresolved candidate retains its checkpoint.
+- Blank rows persist an exact 24-hour retry-floor seed before normal source
+  reads and bypass the first frequency gate. Dry runs remain non-mutating, while
+  timestamp-suppressed mutation mode with no real checkpoint fails before API or
+  playlist work.
+- A successful insert response without a usable playlist-item ID is blocking.
+  Further inserts stop, one exact recovered handle is rolled back, and ambiguous
+  recovery is reported for manual review rather than treated as success.
+- The read-only experiment helper now matches production's fail-closed boundary
+  for `ALL` subscription reads and malformed target items, and omits the
+  unsupported `maxResults` parameter from `videos.list(id=...)` requests.
+
+## Future work
+
+- A possible v6 may revalidate and repair historical target contents. It is not
+  part of v5.3 and requires separate authorization because it deletes playlist
+  items.
+- A durable write-ahead mutation journal would preserve ambiguous insert state
+  across Apps Script hard termination or transport-timeout windows. V5.3 retains
+  the current checkpoint and requests manual review when immediate exact
+  reconciliation cannot identify one rollback handle, but that condition is not
+  yet persisted across executions.
 

@@ -1,4 +1,4 @@
-# Experiment helper integration
+# V5.3 experiment helper integration
 
 `apps-script/Experiment.gs` is designed to be added to the same Apps Script
 project as `sheetScript.gs`. It provides read-only evidence helpers; it is not a
@@ -16,10 +16,18 @@ second production updater.
   `replayStrictDryRun(rowNumber)`. The generic replay reads the existing column-B
   timestamp, discovers candidates, classifies them, reads the target for a write
   plan, and emits one `STRICT_REPLAY_RESULT` JSON log line.
+- `diagnoseRow4TargetAccessReadOnly()` and `diagnoseTargetAccessReadOnly()` verify
+  the authorized YouTube identity, exact target lookup, ownership visibility,
+  first-item access, and full pagination without mutating the playlist or sheet.
+  IDs are hashed before logging.
 
 The structured replay result contains video IDs because the experiment protocol
 compares candidates by ID. It contains source hashes and source column numbers,
 but never channel IDs or source-playlist IDs.
+
+Large forensic payloads can exceed Apps Script's per-line log display. The helper
+therefore emits a compact `STRICT_REPLAY_SUMMARY` first, followed by the complete
+`STRICT_REPLAY_RESULT` payload.
 
 ## Main-code assumptions
 
@@ -36,12 +44,29 @@ but never channel IDs or source-playlist IDs.
 - Strict broadcast classification is intentionally independent of V4's
   duration-based `passesLiveLikeFilter()`: column F is read by neither the strict
   classifier nor the source reader.
-- `videos.list` is batched at 50 IDs and explicitly requests `maxResults: 50`.
-  Missing, malformed, or failed metadata is withheld and makes
+- `videos.list` is batched at 50 IDs. Its `id` requests deliberately omit
+  `maxResults`, which the API does not support together with `id`. Missing,
+  malformed, omitted, or failed metadata is withheld and makes
   `checkpointWouldAdvance` false.
-- A permanent missing source is a warning, matching V4's error isolation. Other
-  source failures are blocking, but candidates obtained from healthy sources are
-  still classified.
+- Source reads track how many complete pages were received. A permanently
+  missing playlist before the first source page is a warning. Any failure after
+  at least one page is blocking, while candidates from completed pages and
+  healthy sources are preserved and still classified.
+- The first-page warning is limited to permanent missing-playlist errors. Quota,
+  transient, malformed-response, and other failures are blocking. Target-read
+  and metadata-filter 404s are also blocking; they are not reclassified as
+  source warnings.
+- The special `ALL` subscription source has no independently disposable
+  playlist ID. Every subscription-page failure and every subscription item
+  without a channel ID is therefore blocking, even when valid channel IDs from
+  completed items remain available for diagnosis.
+- A target item without a video ID makes the replay's target inventory
+  incomplete and blocks `checkpointWouldAdvance`; it is never treated as proof
+  that a candidate is absent.
+- A first-page 404 does not prove that a source is empty. This behavior chooses
+  row liveness under the sheet's single row-wide checkpoint. Fully lossless
+  handling would require per-source checkpoints or persistent disabled-source
+  state.
 
 ## Mutation boundary
 

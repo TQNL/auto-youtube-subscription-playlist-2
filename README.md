@@ -2,17 +2,35 @@
 This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
 
 > **TQNL reliability fork:** development in this fork is strict and evidence-led.
-> The current production candidate is `sheetScript.gs`; immutable prior iterations
-> are in [`versions/`](./versions), the experiment procedure is documented in
+> The v5.3 production candidate is `sheetScript.gs`; selected immutable
+> iterations are in [`versions/`](./versions), the experiment procedure is documented in
 > [`docs/EXPERIMENT_PROTOCOL.md`](./docs/EXPERIMENT_PROTOCOL.md), and the deliberate
 > Premiere/livestream tradeoff is documented in
 > [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md).
 
-The current lab candidate uses a strict, fail-closed rule: upcoming, active, and
+The current candidate uses a strict, fail-closed rule: upcoming, active, and
 completed broadcast-like videos are rejected regardless of duration. Column F is
 kept only so existing sheets retain their column layout; it is not a livestream
 classifier. See the policy document before deploying if retaining every Premiere
 is more important to you than preventing every detectable livestream.
+The 2026-08-21 and 2026-08-22 production evidence is recorded in
+[`docs/LIVE_VALIDATION_2026-08-21.md`](./docs/LIVE_VALIDATION_2026-08-21.md).
+
+V5.3 also isolates source availability from filtering and insertion state. A
+permanently missing playlist on the first page of a source read is logged as a
+warning so other healthy sources can complete; a later-page source failure, or a
+target/filter error that leaves work unresolved, retains the row checkpoint. The
+first-page exception is a deliberate liveness tradeoff. Fully lossless source
+recovery would require a checkpoint (or disabled-state record) for each source
+rather than one timestamp for the entire row. V5.3 does not remove broadcasts
+inserted by older versions; historical cleanup remains separately authorized.
+
+Promotion remains pending. The latest candidate has 60 local regressions plus
+14 legacy regressions, but YouTube quota prevented the required exact row-5
+Premiere replay after the final defensive hardening. A malformed insert response
+without a playlist-item ID is reconciled and rolled back when one exact handle is
+recoverable; zero or multiple matches remain a manual-review condition because
+V5.3 does not yet have a durable cross-execution mutation journal.
 
 This is done using Google Sheets for interface, Google Script + Youtube API v3 for executing and scheduling.
 
@@ -154,7 +172,12 @@ A: See https://stackoverflow.com/a/48912679/1544154 (thanks to [LPanic](https://
 
 ##### Q: I get this error: `TypeError: Cannot read property "items" from undefined. (line 169, file "Code")`
 
-A: If it only happens sometimes, it can be safely ignored, the next round will work normal again. If it happens on every execution, check your playlist and channel IDs. The script stops working if any of your playlists or channels doesn't exist, for example because it was deleted.
+A: The current script validates API responses instead of dereferencing missing
+`items`. A permanently missing source playlist on its first page is logged as a
+warning and healthy sources continue. Transient or partial source failures, and
+unresolved target/filter failures, retain that row's timestamp for retry without
+stopping later rows. Check the Debug sheet and fix or remove a source that fails
+persistently.
 
 ##### Q: I get `Quota` or `Cannot (Search) YouTube` errors
 
