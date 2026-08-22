@@ -3,6 +3,26 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
+## Completed-Premiere heuristic experiment (unpromoted)
+
+- Branch `experiment/premiere-under-90m` derives from the signed-off V5.3
+  candidate and keeps its source, checkpoint, target-read, write-budget, and
+  rollback safeguards.
+- `classifyVideoStrict()` remains factual. A separate shared admission evaluator
+  allows a `COMPLETED_LIVE` item only as a `HEURISTIC_PREMIERE_CANDIDATE` when
+  both documented duration sources are valid and
+  `max(playback duration, actual end - actual start) <= 5,400 seconds`.
+- Upcoming and active broadcasts remain rejected but are checkpoint-blocking so
+  they can be reconsidered after completion. Missing, zero, malformed, or
+  contradictory completed-broadcast timing is also withheld and blocking.
+- The hardcoded boundary is applied identically during initial filtering,
+  pre-insert validation, post-insert validation/rollback, untracked-insert
+  recovery, target audit, and the independent read-only replay helper.
+- Column E's Shorts filter remains independent; column F remains ignored. See
+  [the experiment policy and promotion gate](./docs/PREMIERE_90M_EXPERIMENT.md).
+- This entry remains unpromoted until the isolated real playlist proves the known
+  completed Premiere is inserted while the prepared over-limit livestream is not.
+
 ## Upstream baseline
 
 - `v0-upstream.gs` — the upstream project state at commit `8e0b064`.

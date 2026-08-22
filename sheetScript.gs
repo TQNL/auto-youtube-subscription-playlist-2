@@ -1,4 +1,4 @@
-// Strict-ingestion experiment v5.3: 2026-08-22
+// Completed-Premiere heuristic experiment v5.4-exp1: 2026-08-22
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -17,11 +17,15 @@ var playlistWriteOperationsUsed = 0;
 var targetMembershipProbesUsed = 0;
 var targetMembershipQuotaFailure = null;
 
-// Strict policy: duration is never used to identify livestreams. A video is
-// admitted only when videos.list proves liveBroadcastContent == "none" and
-// liveStreamingDetails is absent. This intentionally rejects Premieres when
-// YouTube exposes them as broadcast-like; the public API has no reliable
-// completed-Premiere discriminator.
+// Experimental completed-broadcast exception. The public API has no reliable
+// completed-Premiere discriminator, so a completed broadcast-like item is only
+// admitted as a heuristic Premiere candidate when BOTH its playback duration
+// and actual start-to-end interval are proven at or below this hardcoded limit.
+// Taking the larger duration prevents a trimmed long livestream archive from
+// slipping through. Upcoming and active broadcasts remain unconditionally
+// rejected from insertion but retain the checkpoint for completion retry, and
+// column F remains reserved/ignored.
+var completedBroadcastExperimentMaxSeconds = 90 * 60;
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -48,7 +52,7 @@ var reservedColumnTimestamp = 1;    // Column containing last timestamp
 var reservedColumnFrequency = 2;    // Column containing number of hours until new check
 var reservedColumnDeleteDays = 3;   // Column containing number of days before today until videos get deleted
 var reservedColumnShortsFilter = 4; // Column containing switch for using shorts filter
-var reservedColumnLegacyLivestreamSetting = 5; // Reserved for sheet compatibility; strict policy ignores column F
+var reservedColumnLegacyLivestreamSetting = 5; // Reserved for sheet compatibility; the hardcoded experiment ignores column F
 // Reserved lengths
 var reservedDebugNumRows = 900;   // Number of rows to use in a column before moving on to the next column in debug sheet
 var reservedDebugNumColumns = 26; // Number of columns to use in debug sheet, must be at least 4 to allow infinite cycle
@@ -383,7 +387,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
   // could lose retryable candidates (transient source/filter/write/unexpected)
   // block the timestamp. Permanent bad-source and cleanup issues are warnings.
   if (experimentDryRun) {
-    safeLog("[STRICT DRY RUN] Would submit " + newVideoIds.length + " strictly eligible video(s) for target de-duplication and insertion");
+    safeLog("[DRY RUN] Would submit " + newVideoIds.length + " admission-eligible video(s) for target de-duplication and insertion");
   } else if (!debugFlag_dontUpdatePlaylists) {
     addVideosToPlaylist(playlistId, newVideoIds);
   } else {
@@ -1129,9 +1133,9 @@ function getTargetPendingVideoIds(playlistId, videoIds, inventory, maxMembership
   };
 }
 
-// Non-mutating v5 audit. This deliberately does not repair the target yet: the
-// live experiment must first establish how many existing entries strict policy
-// would classify as broadcasts (including the Premiere tradeoff).
+// Non-mutating target audit. Factual broadcast classification stays separate
+// from the experimental admission decision so reports do not mislabel a
+// heuristic Premiere candidate as a proven Premiere.
 function inspectTargetPlaylistStrict(playlistId) {
   var playlistItems = [];
   var nextPageToken = null;
@@ -1173,6 +1177,9 @@ function inspectTargetPlaylistStrict(playlistId) {
     COMPLETED_LIVE: 0,
     UNKNOWN: 0
   };
+  var admittedHeuristicCompletedBroadcastCount = 0;
+  var forbiddenCount = 0;
+  var withheldCount = 0;
 
   for (var start = 0; start < videoIds.length; start += 50) {
     var batch = videoIds.slice(start, start + 50);
@@ -1181,6 +1188,7 @@ function inspectTargetPlaylistStrict(playlistId) {
       if (!response || !Array.isArray(response.items)) {
         recordRowError("policy", "Strict target audit received invalid metadata for batch starting with " + batch[0]);
         counts.UNKNOWN += batch.length;
+        withheldCount += batch.length;
         continue;
       }
 
@@ -1190,15 +1198,35 @@ function inspectTargetPlaylistStrict(playlistId) {
       });
       batch.forEach(function(videoId) {
         var item = itemsById[videoId];
-        var classification = item ? classifyVideoStrict(item) : "UNKNOWN";
+        var decision = item ? evaluateVideoAdmissionPolicy(item) : {
+          allowed: false,
+          blocking: true,
+          classification: "UNKNOWN",
+          reason: "video_metadata_missing"
+        };
+        var classification = decision.classification;
         counts[classification] += 1;
-        if (classification != "NORMAL_UPLOAD") {
-          safeLog("[STRICT TARGET AUDIT] " + classification + ": " + formatVideoEvidence(videoId, item));
+        if (decision.allowed && classification == "COMPLETED_LIVE") {
+          admittedHeuristicCompletedBroadcastCount += 1;
+          safeLog("[PREMIERE EXPERIMENT TARGET AUDIT] HEURISTIC_PREMIERE_CANDIDATE: " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
+        } else if (decision.blocking) {
+          withheldCount += 1;
+          recordRowError(
+            "policy",
+            "Premiere experiment target audit withheld " + classification + ": " +
+            formatVideoAdmissionEvidence(videoId, item, decision)
+          );
+        } else if (!decision.allowed) {
+          forbiddenCount += 1;
+          safeLog("[PREMIERE EXPERIMENT TARGET AUDIT] REJECTED " + classification + ": " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
         }
       });
     } catch (e) {
       recordRowError("policy", "Strict target metadata audit failed for batch starting with " + batch[0] + ": " + describeError(e));
       counts.UNKNOWN += batch.length;
+      withheldCount += batch.length;
     }
   }
 
@@ -1206,7 +1234,9 @@ function inspectTargetPlaylistStrict(playlistId) {
     playlistItemCount: playlistItems.length,
     uniqueVideoCount: videoIds.length,
     classifications: counts,
-    forbiddenCount: counts.UPCOMING + counts.ACTIVE + counts.COMPLETED_LIVE,
+    admittedHeuristicCompletedBroadcastCount: admittedHeuristicCompletedBroadcastCount,
+    forbiddenCount: forbiddenCount,
+    withheldCount: withheldCount,
     unknownCount: counts.UNKNOWN,
     mutationPerformed: false
   };
@@ -1216,7 +1246,7 @@ function inspectTargetPlaylistStrict(playlistId) {
 
 // Re-check candidates immediately before insertion. The acquisition/filter pass
 // can be seconds earlier, so this closes the observable state-change window and
-// fails closed if metadata cannot be proven safe.
+// fails closed if metadata cannot be proven safe under the same admission rule.
 function revalidateStrictCandidates(videoIds, context) {
   var allowedVideoIds = [];
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -1240,13 +1270,19 @@ function revalidateStrictCandidates(videoIds, context) {
           return;
         }
 
-        var classification = classifyVideoStrict(item);
-        if (classification == "NORMAL_UPLOAD") {
+        var decision = evaluateVideoAdmissionPolicy(item);
+        if (decision.allowed) {
           allowedVideoIds.push(videoId);
-        } else if (classification == "UNKNOWN") {
-          recordRowError("policy", "Cannot prove video " + videoId + " is a normal upload while " + context + "; withholding it");
+          if (decision.classification == "COMPLETED_LIVE") {
+            safeLog("Premiere experiment retained heuristic candidate during " + context + ": " +
+              formatVideoAdmissionEvidence(videoId, item, decision));
+          }
+        } else if (decision.blocking) {
+          recordRowError("policy", "Video " + videoId + " is not currently eligible while " + context +
+            " and must be retried: " + formatVideoAdmissionEvidence(videoId, item, decision));
         } else {
-          safeLog("Strict policy rejected " + classification + " during " + context + ": " + formatVideoEvidence(videoId, item));
+          safeLog("Premiere experiment rejected " + decision.classification + " during " + context + ": " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
         }
       });
     } catch (e) {
@@ -1340,17 +1376,23 @@ function postValidateInsertWithoutRollbackHandle(videoId) {
     var item = response && Array.isArray(response.items)
       ? response.items.filter(function(candidate) { return candidate && candidate.id === videoId; })[0]
       : null;
-    var classification = item ? classifyVideoStrict(item) : "UNKNOWN";
-    if (classification === "NORMAL_UPLOAD") {
+    var decision = item ? evaluateVideoAdmissionPolicy(item) : {
+      allowed: false,
+      blocking: true,
+      classification: "UNKNOWN",
+      reason: "video_metadata_missing"
+    };
+    if (decision.allowed) {
       safeLog(
         "Untracked likely insertion for video " + videoId +
-        " still classified as NORMAL_UPLOAD, but its target item could not be identified; manual review remains required"
+        " still satisfies the admission policy, but its target item could not be identified; manual review remains required"
       );
     } else {
       recordRowError(
         "policy",
         "Untracked likely insertion for video " + videoId + " has post-insert classification " +
-        classification + " and cannot be rolled back automatically; urgent manual target-playlist review is required"
+        decision.classification + " (" + decision.reason +
+        ") and cannot be rolled back automatically; urgent manual target-playlist review is required"
       );
     }
   } catch (e) {
@@ -1395,14 +1437,22 @@ function postValidateInsertedItems(records, existingVideos) {
 
     batchRecords.forEach(function(record) {
       var item = itemsById[record.videoId];
-      var classification = item ? classifyVideoStrict(item) : "UNKNOWN";
-      if (classification == "NORMAL_UPLOAD") return;
+      var decision = item ? evaluateVideoAdmissionPolicy(item) : {
+        allowed: false,
+        blocking: true,
+        classification: "UNKNOWN",
+        reason: "video_metadata_missing"
+      };
+      if (decision.allowed) return;
 
-      var reason = item ? "post-insert classification changed to " + classification : "video was omitted by post-insert metadata";
-      if (classification == "UNKNOWN") {
-        recordRowError("policy", "Post-insert state for video " + record.videoId + " is unverifiable");
+      var reason = item
+        ? "post-insert admission changed to " + decision.reason + " (" + decision.classification + ")"
+        : "video was omitted by post-insert metadata";
+      if (decision.blocking) {
+        recordRowError("policy", "Post-insert state for video " + record.videoId +
+          " requires retry: " + reason + "; rolling it back");
       } else {
-        recordRowWarning("policy", "Post-insert state for video " + record.videoId + " is " + classification + "; rolling it back");
+        recordRowWarning("policy", "Post-insert state for video " + record.videoId + " is no longer eligible: " + reason + "; rolling it back");
       }
       rollbackInsertedPlaylistItem(record, existingVideos, reason);
     });
@@ -1468,9 +1518,9 @@ function addVideosToPlaylist(playlistId, videoIds) {
     pendingVideoIds = pendingVideoIds.slice(0, safeInsertCapacity);
   }
 
-  pendingVideoIds = revalidateStrictCandidates(pendingVideoIds, "pre-insert strict revalidation");
+  pendingVideoIds = revalidateStrictCandidates(pendingVideoIds, "pre-insert admission revalidation");
   if (!pendingVideoIds.length) {
-    safeLog("No strictly eligible videos remain after pre-insert revalidation.");
+    safeLog("No eligible videos remain after pre-insert admission revalidation.");
     return;
   }
 
@@ -1637,7 +1687,7 @@ function applyFilters(videoIds, sheet, iRow) {
   var filterShorts = shortsSetting == "no";
 
   if (filterShorts) safeLog("Removing shorts");
-  safeLog("Strict livestream policy: rejecting upcoming, active, and completed broadcast-like videos; column F is ignored");
+  safeLog("Premiere experiment: rejecting upcoming/active broadcasts and completed broadcasts over the hardcoded 90-minute effective-duration limit; column F is ignored");
 
   var filteredVideoIds = [];
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -1663,14 +1713,20 @@ function applyFilters(videoIds, sheet, iRow) {
           return;
         }
 
-        var classification = classifyVideoStrict(item);
-        if (classification == "UNKNOWN") {
-          recordRowError("filter", "Cannot prove video is a normal upload: " + formatVideoEvidence(videoId, item));
+        var decision = evaluateVideoAdmissionPolicy(item);
+        if (decision.blocking) {
+          recordRowError("filter", "Cannot prove video is eligible under the Premiere experiment: " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
           return;
         }
-        if (classification != "NORMAL_UPLOAD") {
-          safeLog("Strict policy rejected " + classification + ": " + formatVideoEvidence(videoId, item));
+        if (!decision.allowed) {
+          safeLog("Premiere experiment rejected " + decision.classification + ": " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
           return;
+        }
+        if (decision.classification == "COMPLETED_LIVE") {
+          safeLog("Premiere experiment admitted HEURISTIC_PREMIERE_CANDIDATE: " +
+            formatVideoAdmissionEvidence(videoId, item, decision));
         }
 
         var duration = item.contentDetails && item.contentDetails.duration;
@@ -1709,8 +1765,159 @@ function isLessThanThreeMinutes(duration) {
   return duration.match("^PT([12]M|[1-5]?[0-9]S){1,2}$") != null;
 }
 
+// Parse the documented ISO 8601 duration form used by videos.contentDetails.
+// Days are supported so very long videos fail the 90-minute experiment safely;
+// an empty P/PT, signs, calendar months/years, and malformed values are rejected.
+function parseIso8601DurationSeconds(duration) {
+  var text = normalizeCellValue(duration);
+  var match = text.match(
+    /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/
+  );
+  if (!match || text.slice(-1) == "T" || !match.slice(1).some(function(value) { return value !== undefined; })) {
+    return null;
+  }
+
+  var days = Number(match[1] || 0);
+  var hours = Number(match[2] || 0);
+  var minutes = Number(match[3] || 0);
+  var seconds = Number(match[4] || 0);
+  var total = (((days * 24) + hours) * 60 + minutes) * 60 + seconds;
+  return isFinite(total) && total >= 0 ? total : null;
+}
+
+function parseApiTimestampMillis(value) {
+  var text = normalizeCellValue(value);
+  if (!text) return null;
+
+  // YouTube documents these values as ISO 8601 datetimes. Accept the strict
+  // RFC3339-compatible profile that the API emits: a complete date and time,
+  // optional fractional seconds, and a mandatory Z or numeric timezone. Do not
+  // delegate validation to Date.parse(), which accepts non-ISO strings and even
+  // normalizes impossible calendar dates such as February 30.
+  var match = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/
+  );
+  if (!match) return null;
+
+  var year = Number(match[1]);
+  var month = Number(match[2]);
+  var day = Number(match[3]);
+  var hour = Number(match[4]);
+  var minute = Number(match[5]);
+  var second = Number(match[6]);
+  var fractionDigits = match[7] || "";
+  var timezoneSign = match[9] || "";
+  var timezoneHours = Number(match[10] || 0);
+  var timezoneMinutes = Number(match[11] || 0);
+
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return null;
+  if (timezoneHours > 14 || timezoneMinutes > 59 ||
+      (timezoneHours == 14 && timezoneMinutes !== 0)) return null;
+  // RFC3339 uses -00:00 to mean that the local offset is unknown. That cannot
+  // prove an actual elapsed interval, so reject it instead of treating it as Z.
+  if (timezoneSign == "-" && timezoneHours === 0 && timezoneMinutes === 0) return null;
+
+  var leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  var daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > daysInMonth[month - 1]) return null;
+
+  // setUTCFullYear avoids Date.UTC's special interpretation of years 0..99.
+  var date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  var millis = date.getTime();
+  if (!isFinite(millis)) return null;
+
+  var fractionalMillis = fractionDigits
+    ? Number("0." + fractionDigits) * 1000
+    : 0;
+  if (!isFinite(fractionalMillis)) return null;
+
+  var offsetMinutes = timezoneHours * 60 + timezoneMinutes;
+  if (timezoneSign == "-") offsetMinutes *= -1;
+  millis += fractionalMillis - offsetMinutes * 60 * 1000;
+  return isFinite(millis) ? millis : null;
+}
+
+// Keep factual classification separate from admission. The API cannot prove a
+// completed broadcast was a Premiere; this helper labels the <=90-minute result
+// as a heuristic candidate and requires complete, internally consistent timing
+// evidence. Transitional or unknown/incomplete evidence is blocking so a
+// possibly eligible Premiere is retried instead of being lost behind an
+// advanced checkpoint.
+function evaluateVideoAdmissionPolicy(item) {
+  var classification = classifyVideoStrict(item);
+  var decision = {
+    allowed: false,
+    blocking: false,
+    classification: classification,
+    admissionClass: classification,
+    reason: ""
+  };
+
+  if (classification == "NORMAL_UPLOAD") {
+    decision.allowed = true;
+    decision.reason = "normal_upload";
+    return decision;
+  }
+  if (classification == "UPCOMING") {
+    decision.blocking = true;
+    decision.reason = "upcoming_broadcast";
+    return decision;
+  }
+  if (classification == "ACTIVE") {
+    decision.blocking = true;
+    decision.reason = "active_broadcast";
+    return decision;
+  }
+  if (classification != "COMPLETED_LIVE") {
+    decision.blocking = true;
+    decision.reason = "live_state_missing_or_unknown";
+    return decision;
+  }
+
+  var contentDuration = item && item.contentDetails && item.contentDetails.duration;
+  var contentDurationSeconds = parseIso8601DurationSeconds(contentDuration);
+  var details = item && item.liveStreamingDetails;
+  var actualStartMillis = parseApiTimestampMillis(details && details.actualStartTime);
+  var actualEndMillis = parseApiTimestampMillis(details && details.actualEndTime);
+  decision.contentDurationSeconds = contentDurationSeconds;
+
+  if (contentDurationSeconds === null || contentDurationSeconds <= 0) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_duration_missing_or_invalid";
+    return decision;
+  }
+  if (actualStartMillis === null || actualEndMillis === null) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_actual_times_missing_or_invalid";
+    return decision;
+  }
+  if (actualEndMillis <= actualStartMillis) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_actual_time_order_invalid";
+    return decision;
+  }
+
+  var actualDurationSeconds = (actualEndMillis - actualStartMillis) / 1000;
+  var effectiveDurationSeconds = Math.max(contentDurationSeconds, actualDurationSeconds);
+  decision.actualDurationSeconds = actualDurationSeconds;
+  decision.effectiveDurationSeconds = effectiveDurationSeconds;
+  decision.maxEffectiveDurationSeconds = completedBroadcastExperimentMaxSeconds;
+
+  if (effectiveDurationSeconds <= completedBroadcastExperimentMaxSeconds) {
+    decision.allowed = true;
+    decision.admissionClass = "HEURISTIC_PREMIERE_CANDIDATE";
+    decision.reason = "completed_broadcast_within_90_minute_experiment_limit";
+  } else {
+    decision.reason = "completed_broadcast_over_90_minute_experiment_limit";
+  }
+  return decision;
+}
+
 // Classify only from documented API fields. Duration and title are deliberately
-// excluded: they are not livestream type signals.
+// excluded from factual type classification; duration is considered only by the
+// separate experimental admission helper above.
 function classifyVideoStrict(item) {
   if (!item || !item.snippet) return "UNKNOWN";
 
@@ -1723,6 +1930,23 @@ function classifyVideoStrict(item) {
     return "COMPLETED_LIVE";
   }
   return "NORMAL_UPLOAD";
+}
+
+function formatVideoAdmissionEvidence(videoId, item, decision) {
+  var evidence = formatVideoEvidence(videoId, item);
+  if (!decision) return evidence;
+  evidence += " | admission: " + (decision.admissionClass || decision.classification || "UNKNOWN") +
+    " | decision: " + (decision.reason || "unknown");
+  if (decision.contentDurationSeconds !== undefined && decision.contentDurationSeconds !== null) {
+    evidence += " | playbackSeconds: " + decision.contentDurationSeconds;
+  }
+  if (decision.actualDurationSeconds !== undefined && decision.actualDurationSeconds !== null) {
+    evidence += " | actualSeconds: " + decision.actualDurationSeconds;
+  }
+  if (decision.effectiveDurationSeconds !== undefined && decision.effectiveDurationSeconds !== null) {
+    evidence += " | effectiveSeconds: " + decision.effectiveDurationSeconds;
+  }
+  return evidence;
 }
 
 function formatVideoEvidence(videoId, item) {
