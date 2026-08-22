@@ -97,8 +97,15 @@ Official API references:
 
 ## Promotion gate
 
-Do not call the experiment validated until all of the following are proven on
-the isolated sheet and target playlist:
+The isolated live validation passed on 2026-08-22 for audited deployed commit
+`962b91da048706e7a6407e4df28d9121826a9ddd`. The read-only replay kept only the
+known Premiere, production inserted it, and the exact read-only target verifier
+confirmed that neither prepared over-limit livestream was present. The full
+source-configuration and row-4 source fingerprints were unchanged. See the
+[live-validation record](./LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md)
+for the complete evidence.
+
+The validation satisfied all of the experiment gates:
 
 1. the read-only replay acquires the known Premiere and at least one over-limit
    completed livestream;
@@ -107,3 +114,8 @@ the isolated sheet and target playlist:
 4. the row checkpoint advances without a blocking error;
 5. the full source-configuration fingerprint is unchanged; and
 6. the resulting target membership is verified by exact video ID.
+
+Passing this gate validates the prepared experiment corpus; it does not remove
+the documented false-positive risk for completed livestreams of 90 minutes or
+less. The branch remains unpromoted pending an explicit decision to accept that
+tradeoff and the coarse row-checkpoint retry behavior.
