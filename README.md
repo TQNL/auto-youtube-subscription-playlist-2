@@ -3,23 +3,31 @@ This is a Google Apps Script that automatically adds new Youtube videos to playl
 
 > **TQNL reliability fork:** development in this fork is strict and evidence-led.
 > This experiment branch derives `sheetScript.gs` from the signed-off V5.3
-> production candidate; selected immutable iterations are in [`versions/`](./versions), the experiment procedure is documented in
+> production candidate; the proven experiment snapshot is
+> [`versions/v5.4-exp1-premiere-under-90m.gs`](./versions/v5.4-exp1-premiere-under-90m.gs),
+> selected earlier iterations are in [`versions/`](./versions), and the experiment
+> procedure is documented in
 > [`docs/EXPERIMENT_PROTOCOL.md`](./docs/EXPERIMENT_PROTOCOL.md), and the deliberate
 > Premiere/livestream tradeoffs are documented in
 > [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md) and
 > [`docs/PREMIERE_90M_EXPERIMENT.md`](./docs/PREMIERE_90M_EXPERIMENT.md).
 
-The current branch is an unpromoted Premiere experiment. Upcoming and active
-broadcasts remain rejected from insertion and retain the row checkpoint for a
-completion retry. A completed broadcast-like item is admitted only as a
-heuristic candidate when the larger of its playback duration and actual
-start-to-end interval is at most a hardcoded 90 minutes. Column F is kept only so
-existing sheets retain their layout and does not configure this rule. A genuine
-completed livestream under 90 minutes can still pass, because the public API has
-no reliable completed-Premiere discriminator; use V5.3 when preventing every
-detectable completed broadcast is more important than retaining Premieres.
-The 2026-08-21 and 2026-08-22 production evidence is recorded in
+The current branch is a live-validated, unpromoted Premiere experiment. Upcoming
+and active broadcasts remain rejected from insertion and retain the row
+checkpoint for a completion retry. A completed broadcast-like item is admitted
+only as a heuristic candidate when the larger of its playback duration and
+actual start-to-end interval is at most a hardcoded 90 minutes. Column F is kept
+only so existing sheets retain their layout and does not configure this rule. A
+genuine completed livestream under 90 minutes can still pass, because the public
+API has no reliable completed-Premiere discriminator; use V5.3 when preventing
+every detectable completed broadcast is more important than retaining
+Premieres.
+The strict V5.3 production evidence is recorded in
 [`docs/LIVE_VALIDATION_2026-08-21.md`](./docs/LIVE_VALIDATION_2026-08-21.md).
+The separate 2026-08-22 experiment record proves that the prepared completed
+Premiere was inserted while both prepared over-limit completed livestreams
+remained absent, without changing the protected source configuration:
+[`docs/LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md`](./docs/LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md).
 
 V5.3 also isolates source availability from filtering and insertion state. A
 permanently missing playlist on the first page of a source read is logged as a

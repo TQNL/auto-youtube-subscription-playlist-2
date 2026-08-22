@@ -3,8 +3,11 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
-## Completed-Premiere heuristic experiment (unpromoted)
+## Completed-Premiere heuristic experiment (live-validated, unpromoted)
 
+- `v5.4-exp1-premiere-under-90m.gs` is the immutable, line-ending-normalized
+  snapshot of the live-validated `sheetScript.gs` source from deployed commit
+  `962b91da048706e7a6407e4df28d9121826a9ddd`.
 - Branch `experiment/premiere-under-90m` derives from the signed-off V5.3
   candidate and keeps its source, checkpoint, target-read, write-budget, and
   rollback safeguards.
@@ -20,8 +23,16 @@ snapshots live in `versions/`, and promoted revisions receive signed-off Git tag
   recovery, target audit, and the independent read-only replay helper.
 - Column E's Shorts filter remains independent; column F remains ignored. See
   [the experiment policy and promotion gate](./docs/PREMIERE_90M_EXPERIMENT.md).
-- This entry remains unpromoted until the isolated real playlist proves the known
-  completed Premiere is inserted while the prepared over-limit livestream is not.
+- Isolated live validation passed on 2026-08-22 for deployed commit
+  `962b91da048706e7a6407e4df28d9121826a9ddd`: the known completed Premiere was
+  the only planned and actual insertion, both prepared over-limit completed
+  livestreams remained absent, the production checkpoint advanced, and the
+  protected source fingerprints were unchanged. See the
+  [experiment live-validation record](./docs/LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md).
+- The branch remains unpromoted because a genuine completed livestream of at
+  most 90 minutes can still pass and transitional broadcasts can retain a
+  row-wide checkpoint. Live validation proves the prepared corpus, not a general
+  Premiere discriminator.
 
 ## Upstream baseline
 
