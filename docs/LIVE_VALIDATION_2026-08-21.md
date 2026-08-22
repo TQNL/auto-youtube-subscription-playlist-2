@@ -1,9 +1,10 @@
 # Strict-ingestion live validation — 2026-08-21 to 2026-08-22
 
 This report begins with the production test of the snapshot archived as
-`versions/v5.1-target-pagination-resilience.gs`, then records the V5.2 diagnosis
-and quota-limited V5.3 `sheetScript.gs` replay. No channel/source cell in column G or
-later was edited, and no existing playlist item was deleted.
+`versions/v5.1-target-pagination-resilience.gs`, then records the V5.2 diagnosis,
+the quota-limited V5.3 replay, and the final hardened row-5 replay. No
+channel/source cell in column G or later was edited, and no existing playlist
+item was deleted.
 
 ## Protected baseline
 
@@ -105,10 +106,54 @@ The protected hashes after the replay were unchanged:
 After this live run, quota-independent audits hardened Logger isolation,
 execution-wide membership-probe limits, blank-checkpoint retry floors, and
 malformed insert-response reconciliation. Those changes pass 60 of 60 current
-tests plus 14 of 14 legacy regressions, but they have not been replayed live
-against row 5 because quota remained exhausted. No deletion was performed during
-any validation run, so livestreams inserted by older versions remain in the
-target playlist.
+tests plus 14 of 14 legacy regressions. No deletion was performed during any
+validation run, so livestreams inserted by older versions remain in the target
+playlist.
+
+## Final hardened row-5 replay — 2026-08-22
+
+YouTube quota was available again at approximately 11:23 local time. The exact
+candidate under test was commit `a1a6306`; `sheetScript.gs` and the archived
+`versions/v5.3-source-page-liveness.gs` both had SHA-256
+`0bef56ab7658ca19c307a02712a5f433ece5ce1f42f67cdf48c3748c816ec1b8`.
+
+The read-only `replayRow5StrictDryRun` helper started from B5
+`2026-08-19T10:25:04+00:00` and reported:
+
+- Acquired only `CkmIANn_xZY`.
+- YouTube returned `liveBroadcastContent: none`,
+  `liveStreamingDetails: present`, and duration `PT1H8M1S`.
+- Classified and rejected the candidate as `COMPLETED_LIVE`.
+- Kept zero IDs, would insert zero IDs, and reported zero warnings and zero
+  blocking errors.
+- Marked the checkpoint eligible to advance.
+
+The exact production `updatePlaylists` function was then run. To keep the broad
+row 4 from consuming quota, C4 was temporarily set to `999999`, making row 4
+not due; no A or G+ cell was changed. Production then:
+
+- Logged row 4 as `Skipped: Not time yet`.
+- Acquired the same one row-5 candidate.
+- Rejected `CkmIANn_xZY` as `COMPLETED_LIVE` using the same documented markers.
+- Finished with zero videos, logged `No new videos yet`, and completed normally.
+- Advanced B5 to `2026-08-22T09:26:43+00:00` without an insertion.
+
+C4 was immediately restored to blank. The post-run
+`snapshotExperimentRows` result proved:
+
+- B4 remained `2026-08-21T22:43:52+00:00`; C4 was blank again.
+- B5 advanced as expected; C5 and D5 remained blank.
+- The full G+ fingerprint remained
+  `sha256:4072f670ccd0e95f684efbf69cf792780e6348f3cbc11bc1619d07cdd141aff5`.
+- The row-4 source fingerprint remained
+  `sha256:c62dd82232754daa9b93d3da71510f2cd894c3c7687de7e0de1a1697fa9e4877`.
+- The row-5 source fingerprint remained
+  `sha256:52c27ee2aa3ced4d154ef50327b290fd6474cc74d0b9113b9afaa3f18a07d2d0`.
+
+This closes the quota-blocked promotion gate for strict future ingestion. The
+controlled Premiere was rejected in both the read-only classifier replay and the
+actual production pipeline, the checkpoint advanced, and no protected source
+configuration drifted.
 
 ## Source-liveness boundary
 
@@ -125,7 +170,9 @@ The evidence validates future ingestion and retry behavior: detectable upcoming,
 active, and completed broadcasts are rejected; first-page permanently missing
 sources no longer cancel healthy candidates; later-page source failures remain
 blocking; and a partial target read does not create duplicates when existing
-membership is already proven. Metadata quota failures remain fail-closed.
+membership is already proven. Metadata quota failures remain fail-closed. The
+exact final hardened candidate also passed the controlled row-5 production
+Premiere replay after quota reset.
 
 V5.3 does not remove livestreams that older versions already inserted.
 Historical cleanup remains a separate, explicitly authorized operation.
