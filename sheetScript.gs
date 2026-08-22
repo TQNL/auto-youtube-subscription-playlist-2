@@ -1167,19 +1167,29 @@ function inspectTargetPlaylistStrict(playlistId) {
     }
   } while (nextPageToken !== null);
 
+  var unidentifiedPlaylistItemCount = 0;
   var videoIds = dedupeVideoIds(playlistItems.map(function(item) {
-    return item && item.contentDetails && item.contentDetails.videoId;
+    var videoId = item && item.contentDetails && item.contentDetails.videoId;
+    if (typeof videoId !== "string" || !videoId.trim()) {
+      unidentifiedPlaylistItemCount += 1;
+      recordRowError(
+        "policy",
+        "Strict target audit found a playlist item without a usable contentDetails.videoId"
+      );
+      return null;
+    }
+    return videoId;
   }));
   var counts = {
     NORMAL_UPLOAD: 0,
     UPCOMING: 0,
     ACTIVE: 0,
     COMPLETED_LIVE: 0,
-    UNKNOWN: 0
+    UNKNOWN: unidentifiedPlaylistItemCount
   };
   var admittedHeuristicCompletedBroadcastCount = 0;
   var forbiddenCount = 0;
-  var withheldCount = 0;
+  var withheldCount = unidentifiedPlaylistItemCount;
 
   for (var start = 0; start < videoIds.length; start += 50) {
     var batch = videoIds.slice(start, start + 50);
@@ -1233,6 +1243,7 @@ function inspectTargetPlaylistStrict(playlistId) {
   var report = {
     playlistItemCount: playlistItems.length,
     uniqueVideoCount: videoIds.length,
+    unidentifiedPlaylistItemCount: unidentifiedPlaylistItemCount,
     classifications: counts,
     admittedHeuristicCompletedBroadcastCount: admittedHeuristicCompletedBroadcastCount,
     forbiddenCount: forbiddenCount,
