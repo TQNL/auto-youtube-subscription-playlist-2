@@ -1,15 +1,16 @@
-// Read-only experiment helpers for strict livestream-filter replays.
+// Read-only helpers for the completed-Premiere heuristic experiment.
 //
 // These functions intentionally do not call processPlaylistRow(), applyFilters(),
 // addVideosToPlaylist(), deletePlaylistItems(), or any Range setter. They read the
 // configured row timestamp and source cells, query YouTube, and report what a
-// strict ingestion policy would do without mutating the sheet or a playlist.
+// experimental admission policy would do without mutating the sheet or a playlist.
 
 var EXPERIMENT_FIRST_DATA_ROW_ = 4;
 var EXPERIMENT_FIRST_SOURCE_COLUMN_ = 7; // G (one-based)
 var EXPERIMENT_TIMESTAMP_COLUMN_ = 2;    // B (one-based)
 var EXPERIMENT_SHORTS_COLUMN_ = 5;       // E (one-based)
 var EXPERIMENT_VISIBLE_COLUMN_COUNT_ = 6; // A:F
+var EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_ = 90 * 60;
 
 /**
  * Return a SHA-256 fingerprint of G:lastColumn for rows 4:lastRow.
@@ -91,6 +92,60 @@ function replayRow5StrictDryRun() {
 
 function diagnoseRow4TargetAccessReadOnly() {
   return diagnoseTargetAccessReadOnly(4);
+}
+
+/**
+ * Verify the isolated row-4 target against the three public experiment videos.
+ *
+ * The target and source IDs remain local. Only the already-public corpus video
+ * IDs, exact membership booleans, aggregate target size, and an opaque source
+ * fingerprint are returned or logged. The existing complete pagination reader
+ * is used, and no sheet or playlist mutation method is called.
+ */
+function verifyRow4PremiereExperimentTargetReadOnly(optionalSheet) {
+  var sheet = experimentConfigurationSheet_(optionalSheet);
+  var expectedSourceHash = sourceConfigurationFingerprint(sheet);
+  var corpusVideoIds = ["CkmIANn_xZY", "SE7aCzUaUdY", "Knnm5_rG89E"];
+
+  try {
+    var targetPlaylistId = experimentNormalize_(
+      sheet.getRange(EXPERIMENT_FIRST_DATA_ROW_, 1).getDisplayValue()
+    );
+    var state = experimentState_();
+    var targetRead;
+    if (!targetPlaylistId) {
+      experimentIssue_(state, "error", "target", "target_playlist_missing");
+      targetRead = {ok: false, videoSet: Object.create(null)};
+    } else {
+      targetRead = experimentReadTargetVideoSet_(targetPlaylistId, state);
+    }
+
+    var membershipByVideoId = Object.create(null);
+    corpusVideoIds.forEach(function(videoId) {
+      membershipByVideoId[videoId] = targetRead.ok
+        ? Object.prototype.hasOwnProperty.call(targetRead.videoSet, videoId)
+        : null;
+    });
+
+    assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
+    var report = {
+      schemaVersion: 1,
+      readOnly: true,
+      rowNumber: EXPERIMENT_FIRST_DATA_ROW_,
+      sourceConfigurationHash: expectedSourceHash,
+      targetReadComplete: targetRead.ok,
+      targetUniqueVideoCount: targetRead.ok ? Object.keys(targetRead.videoSet).length : null,
+      membershipByVideoId: membershipByVideoId,
+      blockingErrorCount: state.blockingErrorCount,
+      warningCount: state.warningCount,
+      issues: state.issues.map(experimentCompactIssue_),
+      mutationPerformed: false
+    };
+    Logger.log("PREMIERE_EXPERIMENT_TARGET_VERIFICATION " + JSON.stringify(report));
+    return report;
+  } finally {
+    assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
+  }
 }
 
 /**
@@ -290,12 +345,13 @@ function experimentReadOnlyApiProbe_(callback) {
 }
 
 /**
- * Read-only replay of one configured playlist row under the strict policy.
+ * Read-only replay of one configured playlist row under the Premiere experiment.
  *
- * Strict means that any documented broadcast marker is rejected. A video is
- * eligible only when snippet.liveBroadcastContent is exactly "none" and
- * liveStreamingDetails is absent. Column F is intentionally ignored because a
- * duration threshold cannot determine whether an item is a livestream.
+ * Upcoming and active broadcasts remain rejected and retry-blocking. A
+ * completed broadcast-like item is admitted only as a heuristic Premiere
+ * candidate when the larger of its playback duration and actual start-to-end
+ * interval is <=90 minutes. Column F is intentionally ignored because the
+ * experiment limit is hardcoded.
  */
 function replayStrictDryRun(rowNumber, optionalSheet) {
   rowNumber = Number(rowNumber);
@@ -344,8 +400,8 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
     assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
 
     var result = {
-      schemaVersion: 1,
-      policy: "strict-documented-broadcast-markers",
+      schemaVersion: 2,
+      policy: "completed-broadcast-under-90m-heuristic-v1",
       dryRun: true,
       rowNumber: rowNumber,
       timestampReadFromColumnB: timestamp,
@@ -355,8 +411,10 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
       sourceHashes: sources.map(function(source) { return source.hash; }),
       filterShorts: filterShorts,
       columnFIgnoredByStrictPolicy: true,
+      completedBroadcastMaxSeconds: EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_,
       acquiredCandidateIds: candidateIds,
       keptCandidateIds: classification.kept,
+      admittedHeuristicCandidates: classification.admittedHeuristicCandidates,
       rejectedCandidates: classification.rejected,
       withheldCandidates: classification.withheld,
       alreadyPresentIds: targetRead.ok ? alreadyPresent : null,
@@ -373,11 +431,11 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
     // decision evidence first in a compact line that remains independently
     // readable even when the full forensic payload below is truncated.
     var summary = experimentReplaySummary_(result);
-    Logger.log("STRICT_REPLAY_SUMMARY " + JSON.stringify(summary));
+    Logger.log("PREMIERE_EXPERIMENT_REPLAY_SUMMARY " + JSON.stringify(summary));
 
     // The structured line contains video IDs for comparison, but no channel IDs
     // or source-playlist IDs. Raw sources remain local variables only.
-    Logger.log("STRICT_REPLAY_RESULT " + JSON.stringify(result));
+    Logger.log("PREMIERE_EXPERIMENT_REPLAY_RESULT " + JSON.stringify(result));
     return result;
   } finally {
     assertSourceConfigurationUnchanged(expectedSourceHash, sheet);
@@ -408,10 +466,12 @@ function experimentReplaySummary_(result) {
     sourceCount: result.sourceCount,
     filterShorts: result.filterShorts,
     columnFIgnoredByStrictPolicy: result.columnFIgnoredByStrictPolicy,
+    completedBroadcastMaxSeconds: result.completedBroadcastMaxSeconds,
     acquiredCandidateCount: (result.acquiredCandidateIds || []).length,
     keptCandidateCount: (result.keptCandidateIds || []).length,
     rejectedCandidateCount: (result.rejectedCandidates || []).length,
     withheldCandidateCount: (result.withheldCandidates || []).length,
+    admittedHeuristicCandidateCount: (result.admittedHeuristicCandidates || []).length,
     rejectionCounts: rejectionCounts,
     withheldCounts: withheldCounts,
     rejectedCandidateSamples: (result.rejectedCandidates || []).slice(0, 25),
@@ -769,7 +829,7 @@ function experimentReadSourcePlaylistVideos_(playlistId, checkpointMillis, sourc
 }
 
 function experimentClassifyStrict_(videoIds, filterShorts, state) {
-  var result = {kept: [], rejected: [], withheld: []};
+  var result = {kept: [], rejected: [], withheld: [], admittedHeuristicCandidates: []};
 
   for (var start = 0; start < videoIds.length; start += 50) {
     var batch = videoIds.slice(start, start + 50);
@@ -811,24 +871,28 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
       var liveState = item.snippet && item.snippet.liveBroadcastContent;
       var hasLiveStreamingDetails = item.liveStreamingDetails !== undefined &&
         item.liveStreamingDetails !== null;
-      var strictClassification = experimentStrictClassification_(item);
+      var admission = experimentAdmissionDecision_(item);
 
-      if (strictClassification === "UPCOMING" || strictClassification === "ACTIVE" ||
-          strictClassification === "COMPLETED_LIVE") {
-        result.rejected.push({
+      if (admission.blocking) {
+        experimentIssue_(state, "error", "filter", admission.reason, null, null, videoId);
+        result.withheld.push({
           videoId: videoId,
-          reason: "broadcast_marker",
-          classification: strictClassification,
-          liveBroadcastContent: liveState || null,
-          hasLiveStreamingDetails: hasLiveStreamingDetails
+          reason: admission.reason,
+          classification: admission.classification
         });
         return;
       }
 
-      // Fail closed: the documented ordinary-video state must be explicit.
-      if (strictClassification !== "NORMAL_UPLOAD") {
-        experimentIssue_(state, "error", "filter", "live_state_missing_or_unknown", null, null, videoId);
-        result.withheld.push({videoId: videoId, reason: "live_state_missing_or_unknown"});
+      if (!admission.allowed) {
+        result.rejected.push({
+          videoId: videoId,
+          reason: admission.reason,
+          classification: admission.classification,
+          liveBroadcastContent: liveState || null,
+          hasLiveStreamingDetails: hasLiveStreamingDetails,
+          effectiveDurationSeconds: admission.effectiveDurationSeconds === undefined
+            ? null : admission.effectiveDurationSeconds
+        });
         return;
       }
 
@@ -844,10 +908,97 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
       }
 
       result.kept.push(videoId);
+      if (admission.classification === "COMPLETED_LIVE") {
+        result.admittedHeuristicCandidates.push({
+          videoId: videoId,
+          classification: admission.classification,
+          admissionClass: admission.admissionClass,
+          contentDurationSeconds: admission.contentDurationSeconds,
+          actualDurationSeconds: admission.actualDurationSeconds,
+          effectiveDurationSeconds: admission.effectiveDurationSeconds
+        });
+      }
     });
   }
 
   return result;
+}
+
+function experimentAdmissionDecision_(item) {
+  // Delegate to the production decision helper whenever both files are loaded.
+  // The fallback is intentionally equivalent so this read-only file is still
+  // safe when copied into an Apps Script project independently.
+  if (typeof evaluateVideoAdmissionPolicy === "function") {
+    return evaluateVideoAdmissionPolicy(item);
+  }
+
+  var classification = experimentStrictClassification_(item);
+  var decision = {
+    allowed: false,
+    blocking: false,
+    classification: classification,
+    admissionClass: classification,
+    reason: ""
+  };
+  if (classification === "NORMAL_UPLOAD") {
+    decision.allowed = true;
+    decision.reason = "normal_upload";
+    return decision;
+  }
+  if (classification === "UPCOMING") {
+    decision.blocking = true;
+    decision.reason = "upcoming_broadcast";
+    return decision;
+  }
+  if (classification === "ACTIVE") {
+    decision.blocking = true;
+    decision.reason = "active_broadcast";
+    return decision;
+  }
+  if (classification !== "COMPLETED_LIVE") {
+    decision.blocking = true;
+    decision.reason = "live_state_missing_or_unknown";
+    return decision;
+  }
+
+  var details = item && item.liveStreamingDetails;
+  var contentSeconds = experimentIsoDurationSeconds_(
+    item && item.contentDetails && item.contentDetails.duration
+  );
+  var startMillis = experimentTimestampMillis_(details && details.actualStartTime);
+  var endMillis = experimentTimestampMillis_(details && details.actualEndTime);
+  decision.contentDurationSeconds = contentSeconds;
+
+  if (contentSeconds === null || contentSeconds <= 0) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_duration_missing_or_invalid";
+    return decision;
+  }
+  if (startMillis === null || endMillis === null) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_actual_times_missing_or_invalid";
+    return decision;
+  }
+  if (endMillis <= startMillis) {
+    decision.blocking = true;
+    decision.reason = "completed_broadcast_actual_time_order_invalid";
+    return decision;
+  }
+
+  decision.actualDurationSeconds = (endMillis - startMillis) / 1000;
+  decision.effectiveDurationSeconds = Math.max(
+    contentSeconds,
+    decision.actualDurationSeconds
+  );
+  decision.maxEffectiveDurationSeconds = EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_;
+  if (decision.effectiveDurationSeconds <= EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_) {
+    decision.allowed = true;
+    decision.admissionClass = "HEURISTIC_PREMIERE_CANDIDATE";
+    decision.reason = "completed_broadcast_within_90_minute_experiment_limit";
+  } else {
+    decision.reason = "completed_broadcast_over_90_minute_experiment_limit";
+  }
+  return decision;
 }
 
 function experimentStrictClassification_(item) {
@@ -920,12 +1071,69 @@ function experimentIsShort_(duration) {
 }
 
 function experimentIsoDurationSeconds_(duration) {
-  var match = String(duration || "").match(
-    /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/
+  if (typeof parseIso8601DurationSeconds === "function") {
+    return parseIso8601DurationSeconds(duration);
+  }
+  var text = experimentNormalize_(duration);
+  var match = text.match(
+    /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/
+  );
+  if (!match || text.slice(-1) === "T" ||
+      !match.slice(1).some(function(value) { return value !== undefined; })) {
+    return null;
+  }
+  var total = (((Number(match[1] || 0) * 24 + Number(match[2] || 0)) * 60 +
+    Number(match[3] || 0)) * 60 + Number(match[4] || 0));
+  return isFinite(total) && total >= 0 ? total : null;
+}
+
+function experimentTimestampMillis_(value) {
+  if (typeof parseApiTimestampMillis === "function") {
+    return parseApiTimestampMillis(value);
+  }
+  var text = experimentNormalize_(value);
+  if (!text) return null;
+
+  var match = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/
   );
   if (!match) return null;
-  return (((Number(match[1] || 0) * 24 + Number(match[2] || 0)) * 60 +
-    Number(match[3] || 0)) * 60 + Number(match[4] || 0));
+
+  var year = Number(match[1]);
+  var month = Number(match[2]);
+  var day = Number(match[3]);
+  var hour = Number(match[4]);
+  var minute = Number(match[5]);
+  var second = Number(match[6]);
+  var fractionDigits = match[7] || "";
+  var timezoneSign = match[9] || "";
+  var timezoneHours = Number(match[10] || 0);
+  var timezoneMinutes = Number(match[11] || 0);
+
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return null;
+  if (timezoneHours > 14 || timezoneMinutes > 59 ||
+      (timezoneHours == 14 && timezoneMinutes !== 0)) return null;
+  if (timezoneSign == "-" && timezoneHours === 0 && timezoneMinutes === 0) return null;
+
+  var leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  var daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > daysInMonth[month - 1]) return null;
+
+  var date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  var millis = date.getTime();
+  if (!isFinite(millis)) return null;
+
+  var fractionalMillis = fractionDigits
+    ? Number("0." + fractionDigits) * 1000
+    : 0;
+  if (!isFinite(fractionalMillis)) return null;
+
+  var offsetMinutes = timezoneHours * 60 + timezoneMinutes;
+  if (timezoneSign == "-") offsetMinutes *= -1;
+  millis += fractionalMillis - offsetMinutes * 60 * 1000;
+  return isFinite(millis) ? millis : null;
 }
 
 function experimentState_() {

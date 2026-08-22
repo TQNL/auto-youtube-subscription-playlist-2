@@ -2,17 +2,22 @@
 This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
 
 > **TQNL reliability fork:** development in this fork is strict and evidence-led.
-> The v5.3 production candidate is `sheetScript.gs`; selected immutable
-> iterations are in [`versions/`](./versions), the experiment procedure is documented in
+> This experiment branch derives `sheetScript.gs` from the signed-off V5.3
+> production candidate; selected immutable iterations are in [`versions/`](./versions), the experiment procedure is documented in
 > [`docs/EXPERIMENT_PROTOCOL.md`](./docs/EXPERIMENT_PROTOCOL.md), and the deliberate
-> Premiere/livestream tradeoff is documented in
-> [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md).
+> Premiere/livestream tradeoffs are documented in
+> [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md) and
+> [`docs/PREMIERE_90M_EXPERIMENT.md`](./docs/PREMIERE_90M_EXPERIMENT.md).
 
-The current candidate uses a strict, fail-closed rule: upcoming, active, and
-completed broadcast-like videos are rejected regardless of duration. Column F is
-kept only so existing sheets retain their column layout; it is not a livestream
-classifier. See the policy document before deploying if retaining every Premiere
-is more important to you than preventing every detectable livestream.
+The current branch is an unpromoted Premiere experiment. Upcoming and active
+broadcasts remain rejected from insertion and retain the row checkpoint for a
+completion retry. A completed broadcast-like item is admitted only as a
+heuristic candidate when the larger of its playback duration and actual
+start-to-end interval is at most a hardcoded 90 minutes. Column F is kept only so
+existing sheets retain their layout and does not configure this rule. A genuine
+completed livestream under 90 minutes can still pass, because the public API has
+no reliable completed-Premiere discriminator; use V5.3 when preventing every
+detectable completed broadcast is more important than retaining Premieres.
 The 2026-08-21 and 2026-08-22 production evidence is recorded in
 [`docs/LIVE_VALIDATION_2026-08-21.md`](./docs/LIVE_VALIDATION_2026-08-21.md).
 

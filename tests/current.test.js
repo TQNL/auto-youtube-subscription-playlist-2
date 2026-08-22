@@ -40,6 +40,13 @@ function makeExperimentContext(youtube, appsScriptGlobals) {
   return context;
 }
 
+function makeExperimentOnlyContext() {
+  const context = {console, Date, Math, JSON, Error, isFinite, Logger: {log() {}}};
+  vm.createContext(context);
+  vm.runInContext(experimentSource, context, {filename: 'Experiment-only.gs'});
+  return context;
+}
+
 function testExplicitPlaylistUsesSupportedPagination() {
   const calls = [];
   const ctx = makeContext({
@@ -275,6 +282,79 @@ function testTransientSourceErrorStillBlocksCheckpoint() {
   assert.strictEqual(ctx.currentRowStatus.sourceWarnings, 0);
   assert.strictEqual(timestampWrites, 0, 'transient source failures must retain the retry checkpoint');
   assert.strictEqual(ctx.currentRowStatus.timestampUpdated, false);
+}
+
+function testTransitionalBroadcastsRetainFullRowCheckpoint() {
+  const candidateIds = ['scheduled-premiere', 'active-premiere'];
+  let timestampWrites = 0;
+  let targetReads = 0;
+  let insertCalls = 0;
+  const ctx = makeContext({
+    Channels: {
+      list() {
+        return {items: [{contentDetails: {relatedPlaylists: {uploads: 'UU_TRANSITIONAL'}}}]};
+      }
+    },
+    PlaylistItems: {
+      list(part, options) {
+        if (options.playlistId === 'UU_TRANSITIONAL') {
+          return {items: candidateIds.map((videoId, index) => ({contentDetails: {
+            videoId,
+            videoPublishedAt: '2026-08-21T0' + (index + 8) + ':00:00Z'
+          }}))};
+        }
+        if (options.playlistId === 'PL_TARGET_12345') {
+          targetReads += 1;
+          return {items: []};
+        }
+        throw new Error('unexpected playlist lookup ' + options.playlistId + ' / ' + part);
+      },
+      insert() { insertCalls += 1; }
+    },
+    Videos: {
+      list() {
+        return {items: [
+          {
+            id: candidateIds[0],
+            snippet: {liveBroadcastContent: 'upcoming'},
+            contentDetails: {duration: 'P0D'},
+            liveStreamingDetails: {scheduledStartTime: '2026-08-22T16:00:00Z'}
+          },
+          {
+            id: candidateIds[1],
+            snippet: {liveBroadcastContent: 'live'},
+            contentDetails: {duration: 'P0D'},
+            liveStreamingDetails: {actualStartTime: '2026-08-21T20:00:00Z'}
+          }
+        ]};
+      }
+    }
+  });
+  const sheet = {
+    getLastColumn: () => 7,
+    getRange(row, column) {
+      return {
+        getValue: () => (column === 5 ? 'Yes' : ''),
+        setValue: () => { timestampWrites += 1; }
+      };
+    }
+  };
+  const data = [[], [], [], [
+    'PL_TARGET_12345', '2026-08-20T00:00:00Z', 0, 0, 'Yes', '', 'UC_TRANSITIONAL_12345'
+  ]];
+
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {};
+  ctx.playlistWriteOperationsUsed = 0;
+  ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
+
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 2);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 2);
+  assert.strictEqual(timestampWrites, 0,
+    'scheduled/live candidates must retain the row checkpoint for completion retry');
+  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, false);
+  assert.strictEqual(targetReads, 0, 'no empty candidate set should trigger a target read');
+  assert.strictEqual(insertCalls, 0);
 }
 
 function testInvalidCheckpointTimestampBlocksBeforeAnyApiOrWrite() {
@@ -1148,6 +1228,98 @@ function testExperimentMalformedTargetItemBlocksReplayCheckpoint() {
   assert.strictEqual(result.issues[0].reason, 'target_playlist_item_metadata_invalid');
 }
 
+function testExperimentReplayRetainsCheckpointForTransitionalBroadcasts() {
+  const targetPlaylistId = 'PL_REPLAY_TARGET';
+  const sourcePlaylistId = 'PL_REPLAY_SOURCE';
+  const candidateIds = ['replay-upcoming', 'replay-active'];
+  const rows = {
+    4: [targetPlaylistId, '2026-08-20T00:00:00Z', '', '', 'Yes', '', sourcePlaylistId]
+  };
+  function cellValue(row, column) {
+    const values = rows[row] || [];
+    return values[column - 1] === undefined ? '' : values[column - 1];
+  }
+  const sheet = {
+    getLastRow: () => 4,
+    getLastColumn: () => 7,
+    getRange(row, column, numRows, numColumns) {
+      const height = numRows || 1;
+      const width = numColumns || 1;
+      return {
+        getValues: () => Array.from({length: height}, (_, rowOffset) =>
+          Array.from({length: width}, (_, columnOffset) =>
+            cellValue(row + rowOffset, column + columnOffset))),
+        getDisplayValues: () => Array.from({length: height}, (_, rowOffset) =>
+          Array.from({length: width}, (_, columnOffset) =>
+            String(cellValue(row + rowOffset, column + columnOffset)))),
+        getFormulas: () => Array.from({length: height}, () =>
+          Array.from({length: width}, () => ''))
+      };
+    }
+  };
+  const utilities = {
+    DigestAlgorithm: {SHA_256: 'SHA_256'},
+    Charset: {UTF_8: 'UTF_8'},
+    computeDigest(algorithm, text, charset) {
+      assert.strictEqual(algorithm, 'SHA_256');
+      assert.strictEqual(charset, 'UTF_8');
+      return Array.from(crypto.createHash('sha256').update(String(text), 'utf8').digest(), value =>
+        value > 127 ? value - 256 : value);
+    }
+  };
+  const ctx = makeExperimentContext({
+    PlaylistItems: {
+      list(part, options) {
+        if (options.playlistId === sourcePlaylistId) {
+          assert.strictEqual(part, 'snippet');
+          return {items: candidateIds.map((videoId, index) => ({snippet: {
+            publishedAt: '2026-08-21T0' + (index + 8) + ':00:00Z',
+            resourceId: {videoId}
+          }}))};
+        }
+        if (options.playlistId === targetPlaylistId) {
+          assert.strictEqual(part, 'contentDetails');
+          return {items: []};
+        }
+        throw new Error('unexpected replay playlist lookup ' + options.playlistId);
+      }
+    },
+    Videos: {
+      list() {
+        return {items: [
+          {
+            id: candidateIds[0],
+            snippet: {liveBroadcastContent: 'upcoming'},
+            contentDetails: {duration: 'P0D'},
+            liveStreamingDetails: {scheduledStartTime: '2026-08-22T16:00:00Z'}
+          },
+          {
+            id: candidateIds[1],
+            snippet: {liveBroadcastContent: 'live'},
+            contentDetails: {duration: 'P0D'},
+            liveStreamingDetails: {actualStartTime: '2026-08-21T20:00:00Z'}
+          }
+        ]};
+      }
+    }
+  }, {Utilities: utilities});
+
+  const result = ctx.replayStrictDryRun(4, sheet);
+
+  assert.deepStrictEqual(Array.from(result.acquiredCandidateIds), candidateIds);
+  assert.deepStrictEqual(Array.from(result.keptCandidateIds), []);
+  assert.deepStrictEqual(Array.from(result.rejectedCandidates), []);
+  assert.deepStrictEqual(
+    Array.from(result.withheldCandidates, candidate => candidate.reason),
+    ['upcoming_broadcast', 'active_broadcast']
+  );
+  assert.strictEqual(result.blockingErrorCount, 2);
+  assert.strictEqual(result.checkpointWouldAdvance, false,
+    'dry-run replay must predict a retained checkpoint for scheduled/live candidates');
+  assert.strictEqual(result.targetReadComplete, true);
+  assert.deepStrictEqual(Array.from(result.wouldInsertIds), []);
+}
+
 function testExperimentVideoMetadata404IsBlocking() {
   const ctx = makeExperimentContext({
     Videos: {
@@ -1239,6 +1411,15 @@ function normalUpload(id, duration) {
   };
 }
 
+function completedBroadcast(id, duration, actualStartTime, actualEndTime) {
+  return {
+    id,
+    snippet: {liveBroadcastContent: 'none'},
+    contentDetails: {duration},
+    liveStreamingDetails: {actualStartTime, actualEndTime}
+  };
+}
+
 function strictFilterSheet(shortsSetting) {
   return {
     getRange(row, column) {
@@ -1303,7 +1484,160 @@ function testStrictClassificationOracle() {
   }), 'UNKNOWN');
 }
 
-function testStrictFilterKeepsOnlyNormalUploads() {
+function testPremiereExperimentDurationParserAndAdmissionBoundary() {
+  const ctx = makeContext();
+  const durationCases = [
+    ['PT1H8M1S', 4081],
+    ['PT1H30M', 5400],
+    ['PT90M', 5400],
+    ['PT5400S', 5400],
+    ['P1D', 86400],
+    ['P0DT1H30M0.001S', 5400.001],
+    ['P', null],
+    ['PT', null],
+    ['P0D', 0],
+    ['-PT1H', null],
+    ['01:30:00', null],
+    ['P1M', null]
+  ];
+  durationCases.forEach(([duration, expected]) => {
+    assert.strictEqual(ctx.parseIso8601DurationSeconds(duration), expected, duration);
+  });
+
+  const premiereDecision = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
+    'CkmIANn_xZY', 'PT1H8M1S', '2026-08-20T19:00:06Z', '2026-08-20T20:09:06Z'
+  ));
+  assert.strictEqual(premiereDecision.allowed, true);
+  assert.strictEqual(premiereDecision.blocking, false);
+  assert.strictEqual(premiereDecision.classification, 'COMPLETED_LIVE');
+  assert.strictEqual(premiereDecision.admissionClass, 'HEURISTIC_PREMIERE_CANDIDATE');
+  assert.strictEqual(premiereDecision.contentDurationSeconds, 4081);
+  assert.strictEqual(premiereDecision.actualDurationSeconds, 4140);
+  assert.strictEqual(premiereDecision.effectiveDurationSeconds, 4140);
+
+  const exactBoundary = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
+    'exact-boundary', 'PT1H30M', '2026-08-20T10:00:00Z', '2026-08-20T11:30:00Z'
+  ));
+  assert.strictEqual(exactBoundary.allowed, true, 'the 5,400-second boundary is inclusive');
+
+  const fractionOver = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
+    'fraction-over', 'PT1H30M0.001S', '2026-08-20T10:00:00Z', '2026-08-20T11:30:00Z'
+  ));
+  assert.strictEqual(fractionOver.allowed, false, 'the boundary must not be rounded');
+  assert.strictEqual(fractionOver.blocking, false);
+
+  const trimmedLongStream = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
+    'trimmed-long-stream', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T12:00:00Z'
+  ));
+  assert.strictEqual(trimmedLongStream.allowed, false,
+    'actual elapsed time must catch a long stream whose replay was trimmed below 90 minutes');
+  assert.strictEqual(trimmedLongStream.effectiveDurationSeconds, 7200);
+
+  assert.strictEqual(
+    ctx.evaluateVideoAdmissionPolicy(normalUpload('ordinary-long', 'PT12H')).allowed,
+    true,
+    'duration must not turn a factual ordinary upload into a livestream'
+  );
+}
+
+function testPremiereExperimentGoldenCorpusAdmissionFixture() {
+  const ctx = makeContext();
+  const corpus = [
+    completedBroadcast(
+      'CkmIANn_xZY',
+      'PT1H8M1S',
+      '2026-08-20T19:00:06Z',
+      '2026-08-20T20:09:06Z'
+    ),
+    completedBroadcast(
+      'SE7aCzUaUdY',
+      'PT7H1M43S',
+      '2026-08-20T10:00:00Z',
+      '2026-08-20T17:11:48Z'
+    ),
+    completedBroadcast(
+      'Knnm5_rG89E',
+      'PT8H55M12S',
+      '2026-08-20T10:00:00Z',
+      '2026-08-20T19:02:32Z'
+    )
+  ];
+
+  const decisions = corpus.map(item => ctx.evaluateVideoAdmissionPolicy(item));
+
+  assert.deepStrictEqual(decisions.map(decision => decision.allowed), [true, false, false]);
+  assert.deepStrictEqual(decisions.map(decision => decision.blocking), [false, false, false]);
+  assert.deepStrictEqual(
+    decisions.map(decision => decision.effectiveDurationSeconds),
+    [4140, 25908, 32552]
+  );
+  assert.strictEqual(decisions[0].admissionClass, 'HEURISTIC_PREMIERE_CANDIDATE');
+  assert.strictEqual(decisions[1].reason, 'completed_broadcast_over_90_minute_experiment_limit');
+  assert.strictEqual(decisions[2].reason, 'completed_broadcast_over_90_minute_experiment_limit');
+}
+
+function testStrictYoutubeTimestampGrammarAndExperimentParity() {
+  const production = makeContext();
+  const experimentOnly = makeExperimentOnlyContext();
+  const validCases = [
+    ['2026-08-20T10:00:00Z', Date.UTC(2026, 7, 20, 10, 0, 0)],
+    [
+      '2024-02-29T23:59:59.123456789+02:30',
+      Date.UTC(2024, 1, 29, 21, 29, 59) + 123.456789
+    ],
+    ['2026-08-20T10:00:00-05:45', Date.UTC(2026, 7, 20, 15, 45, 0)],
+    ['2026-08-20T10:00:00+14:00', Date.UTC(2026, 7, 19, 20, 0, 0)]
+  ];
+  validCases.forEach(([timestamp, expected]) => {
+    const productionMillis = production.parseApiTimestampMillis(timestamp);
+    const fallbackMillis = experimentOnly.experimentTimestampMillis_(timestamp);
+    assert.ok(Math.abs(productionMillis - expected) < 0.001, timestamp);
+    assert.strictEqual(fallbackMillis, productionMillis, 'standalone replay parser parity: ' + timestamp);
+  });
+
+  const invalidCases = [
+    '2026-08-20 10:00:00',
+    '2026-08-20T10:00:00',
+    '2026-08-20',
+    'Thu, 20 Aug 2026 10:00:00 GMT',
+    '2026-02-30T00:00:00Z',
+    '2025-02-29T00:00:00Z',
+    '2026-08-20T24:00:00Z',
+    '2026-08-20T10:60:00Z',
+    '2026-08-20T10:00:60Z',
+    '2026-08-20T10:00:00+14:01',
+    '2026-08-20T10:00:00+24:00',
+    '2026-08-20T10:00:00-00:00',
+    '2026-08-20T10:00:00z'
+  ];
+  invalidCases.forEach(timestamp => {
+    assert.strictEqual(production.parseApiTimestampMillis(timestamp), null, timestamp);
+    assert.strictEqual(
+      experimentOnly.experimentTimestampMillis_(timestamp),
+      null,
+      'standalone replay must reject ' + timestamp
+    );
+  });
+
+  const malformedTimeCandidate = completedBroadcast(
+    'malformed-api-time',
+    'PT1H',
+    '2026-02-30T10:00:00Z',
+    '2026-03-02T11:00:00Z'
+  );
+  const productionDecision = JSON.parse(JSON.stringify(
+    production.evaluateVideoAdmissionPolicy(malformedTimeCandidate)
+  ));
+  const fallbackDecision = JSON.parse(JSON.stringify(
+    experimentOnly.experimentAdmissionDecision_(malformedTimeCandidate)
+  ));
+  assert.strictEqual(productionDecision.allowed, false);
+  assert.strictEqual(productionDecision.blocking, true);
+  assert.strictEqual(productionDecision.reason, 'completed_broadcast_actual_times_missing_or_invalid');
+  assert.deepStrictEqual(fallbackDecision, productionDecision);
+}
+
+function testPremiereExperimentFilterUsesSharedAdmissionDecision() {
   const ids = [
     'long-upload',
     'scheduled',
@@ -1365,12 +1699,33 @@ function testStrictFilterKeepsOnlyNormalUploads() {
   ctx.currentRowStatus = ctx.createRowStatus();
   const result = Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3));
 
-  assert.deepStrictEqual(result, ['long-upload']);
+  assert.deepStrictEqual(result, ['long-upload', 'short-archive']);
   assert.strictEqual(listCalls, 1);
   assert.ok(requestedPart.includes('snippet'));
   assert.ok(requestedPart.includes('contentDetails'));
   assert.ok(requestedPart.includes('liveStreamingDetails'));
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0, 'known broadcast classes are policy rejections, not read failures');
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 3,
+    'scheduled, active, and incomplete completed-broadcast records all retain the checkpoint');
+  assert.ok(ctx.__logs.some(line => line.includes('HEURISTIC_PREMIERE_CANDIDATE') && line.includes('short-archive')));
+}
+
+function testCompletedBroadcastMissingOrInvalidEvidenceIsFailClosed() {
+  const cases = [
+    completedBroadcast('missing-duration', undefined, '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z'),
+    completedBroadcast('zero-duration', 'PT0S', '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z'),
+    completedBroadcast('malformed-duration', '90 minutes', '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z'),
+    completedBroadcast('missing-end', 'PT30M', '2026-08-20T10:00:00Z', undefined),
+    completedBroadcast('reversed-times', 'PT30M', '2026-08-20T10:30:00Z', '2026-08-20T10:00:00Z')
+  ];
+  const ctx = makeContext({Videos: {list() { return {items: cases}; }}});
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  assert.deepStrictEqual(
+    Array.from(ctx.applyFilters(cases.map(item => item.id), strictFilterSheet('Yes'), 3)),
+    []
+  );
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, cases.length);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, cases.length);
 }
 
 function testConstructorVideoIdSurvivesDedupeAndStrictFilter() {
@@ -1450,12 +1805,15 @@ function testSuccessfulMetadataResponseOmissionIsWithheld() {
 }
 
 function testStrictShortFilterRemainsIndependent() {
+  const ids = ['ordinary-short', 'ordinary-video', 'premiere-like-short', 'premiere-like-video'];
   const ctx = makeContext({
     Videos: {
       list() {
         return {items: [
-          normalUpload('ordinary-short', 'PT2M'),
-          normalUpload('ordinary-video', 'PT10M')
+          normalUpload(ids[0], 'PT2M'),
+          normalUpload(ids[1], 'PT10M'),
+          completedBroadcast(ids[2], 'PT2M', '2026-08-20T10:00:00Z', '2026-08-20T10:02:00Z'),
+          completedBroadcast(ids[3], 'PT10M', '2026-08-20T10:00:00Z', '2026-08-20T10:10:00Z')
         ]};
       }
     }
@@ -1463,8 +1821,16 @@ function testStrictShortFilterRemainsIndependent() {
   ctx.currentRowStatus = ctx.createRowStatus();
 
   assert.deepStrictEqual(
-    Array.from(ctx.applyFilters(['ordinary-short', 'ordinary-video'], strictFilterSheet('No'), 3)),
-    ['ordinary-video']
+    Array.from(ctx.applyFilters(ids, strictFilterSheet('No'), 3)),
+    ['ordinary-video', 'premiere-like-video']
+  );
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
+
+  ctx.currentRowStatus = ctx.createRowStatus();
+  assert.deepStrictEqual(
+    Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3)),
+    ids,
+    'E=Yes must retain an otherwise eligible completed broadcast at or below three minutes'
   );
   assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
 }
@@ -1512,11 +1878,33 @@ function testVideoMetadataUsesOneRequestPerFiftyIds() {
   assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
 }
 
+function testExperimentAdmissionFallbackMatchesProductionPolicy() {
+  const production = makeContext();
+  const experimentOnly = makeExperimentOnlyContext();
+  const samples = [
+    normalUpload('ordinary-long', 'PT12H'),
+    {id: 'upcoming', snippet: {liveBroadcastContent: 'upcoming'}, liveStreamingDetails: {}},
+    {id: 'active', snippet: {liveBroadcastContent: 'live'}, liveStreamingDetails: {}},
+    completedBroadcast('known-premiere', 'PT1H8M1S', '2026-08-20T19:00:06Z', '2026-08-20T20:09:06Z'),
+    completedBroadcast('exact-limit', 'PT1H30M', '2026-08-20T10:00:00Z', '2026-08-20T11:30:00Z'),
+    completedBroadcast('long-stream', 'PT7H1M43S', '2026-08-20T10:00:00Z', '2026-08-20T17:11:48Z'),
+    completedBroadcast('trimmed-stream', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T12:00:00Z'),
+    completedBroadcast('missing-end', 'PT30M', '2026-08-20T10:00:00Z', undefined),
+    {id: 'unknown', snippet: {liveBroadcastContent: 'unexpected'}}
+  ];
+
+  samples.forEach(item => {
+    const expected = JSON.parse(JSON.stringify(production.evaluateVideoAdmissionPolicy(item)));
+    const actual = JSON.parse(JSON.stringify(experimentOnly.experimentAdmissionDecision_(item)));
+    assert.deepStrictEqual(actual, expected, item.id);
+  });
+}
+
 function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   const ctx = makeExperimentContext();
   const result = {
-    schemaVersion: 1,
-    policy: 'strict-documented-broadcast-markers',
+    schemaVersion: 2,
+    policy: 'completed-broadcast-under-90m-heuristic-v1',
     dryRun: true,
     rowNumber: 4,
     timestampReadFromColumnB: '2026-08-19T00:00:00.000Z',
@@ -1526,12 +1914,19 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
     sourceHashes: ['sha256:SOURCE-SECRET'],
     filterShorts: true,
     columnFIgnoredByStrictPolicy: true,
+    completedBroadcastMaxSeconds: 5400,
     acquiredCandidateIds: [
       'KEEP-ME-SECRET-1', 'KEEP-ME-SECRET-2',
       'completed-1', 'completed-2', 'active-1', 'upcoming-1',
       'unknown-1', 'unknown-2', 'metadata-missing-1'
     ],
     keptCandidateIds: ['KEEP-ME-SECRET-1', 'KEEP-ME-SECRET-2'],
+    admittedHeuristicCandidates: [{
+      videoId: 'HEURISTIC-SECRET-1',
+      classification: 'COMPLETED_LIVE',
+      admissionClass: 'HEURISTIC_PREMIERE_CANDIDATE',
+      effectiveDurationSeconds: 4140
+    }],
     rejectedCandidates: [
       {videoId: 'completed-1', reason: 'broadcast_marker', classification: 'COMPLETED_LIVE'},
       {videoId: 'completed-2', reason: 'broadcast_marker', classification: 'COMPLETED_LIVE'},
@@ -1575,7 +1970,8 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.strictEqual(summary.keptCandidateCount, 2);
   assert.strictEqual(summary.rejectedCandidateCount, 4);
   assert.strictEqual(summary.withheldCandidateCount, 3);
-  assert.strictEqual(summary.schemaVersion, 1);
+  assert.strictEqual(summary.admittedHeuristicCandidateCount, 1);
+  assert.strictEqual(summary.schemaVersion, 2);
   assert.strictEqual(summary.policy, result.policy);
   assert.strictEqual(summary.dryRun, true);
   assert.strictEqual(summary.rowNumber, 4);
@@ -1587,6 +1983,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.strictEqual(summary.sourceCount, 12);
   assert.strictEqual(summary.filterShorts, true);
   assert.strictEqual(summary.columnFIgnoredByStrictPolicy, true);
+  assert.strictEqual(summary.completedBroadcastMaxSeconds, 5400);
   assert.strictEqual(summary.targetReadComplete, true);
   assert.strictEqual(summary.blockingErrorCount, 3);
   assert.strictEqual(summary.warningCount, 1);
@@ -1594,7 +1991,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.strictEqual(summary.issueCount, 1);
 
   [
-    'sourceHashes',
+    'sourceHashes', 'admittedHeuristicCandidates',
     'acquiredCandidateIds', 'keptCandidateIds', 'alreadyPresentIds', 'wouldInsertIds'
   ].forEach(key => {
     assert.ok(!Object.prototype.hasOwnProperty.call(summary, key), key + ' must not be copied into the compact summary');
@@ -1603,6 +2000,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.ok(!serialized.includes('ISSUE-SOURCE-SECRET'), 'nested issue samples must not leak per-source hashes');
   assert.ok(!serialized.includes('"sourceHash":'), 'issue samples must omit their sourceHash property');
   assert.ok(!serialized.includes('KEEP-ME-SECRET'), 'kept video IDs must not appear in summary JSON');
+  assert.ok(!serialized.includes('HEURISTIC-SECRET'), 'heuristic-admission video IDs must not appear in summary JSON');
 }
 
 function testExperimentReplaySummaryStaysBelowAppsScriptLogLimit() {
@@ -1913,6 +2311,111 @@ function testTargetAccessDiagnosticIsReadOnlyTrimmedHashedAndSourceStable() {
     });
 }
 
+function testPremiereExperimentTargetVerificationIsExactReadOnlyAndPrivate() {
+  const targetPlaylistId = 'PL_PRIVATE_VERIFICATION_TARGET';
+  const sourceId = 'UC_PRIVATE_VERIFICATION_SOURCE';
+  const unrelatedVideoId = 'unrelated-target-member';
+  const rows = {
+    4: [targetPlaylistId, '2026-08-19T00:00:00Z', '', '', 'No', '', sourceId]
+  };
+  let sheetMutationCalls = 0;
+  let youtubeMutationCalls = 0;
+  const pageTokens = [];
+  function cellValue(row, column) {
+    const values = rows[row] || [];
+    return values[column - 1] === undefined ? '' : values[column - 1];
+  }
+  const sheet = {
+    getLastRow: () => 4,
+    getLastColumn: () => 7,
+    getRange(row, column, numRows, numColumns) {
+      const height = numRows || 1;
+      const width = numColumns || 1;
+      const rejectMutation = () => {
+        sheetMutationCalls += 1;
+        throw new Error('verification attempted to mutate the sheet');
+      };
+      return {
+        getDisplayValue: () => String(cellValue(row, column)),
+        getValues: () => Array.from({length: height}, (_, rowOffset) =>
+          Array.from({length: width}, (_, columnOffset) =>
+            cellValue(row + rowOffset, column + columnOffset))),
+        getDisplayValues: () => Array.from({length: height}, (_, rowOffset) =>
+          Array.from({length: width}, (_, columnOffset) =>
+            String(cellValue(row + rowOffset, column + columnOffset)))),
+        getFormulas: () => Array.from({length: height}, () =>
+          Array.from({length: width}, () => '')),
+        setValue: rejectMutation,
+        setValues: rejectMutation,
+        clear: rejectMutation,
+        clearContent: rejectMutation
+      };
+    }
+  };
+  const utilities = {
+    DigestAlgorithm: {SHA_256: 'SHA_256'},
+    Charset: {UTF_8: 'UTF_8'},
+    computeDigest(algorithm, text, charset) {
+      assert.strictEqual(algorithm, 'SHA_256');
+      assert.strictEqual(charset, 'UTF_8');
+      return Array.from(crypto.createHash('sha256').update(String(text), 'utf8').digest(), value =>
+        value > 127 ? value - 256 : value);
+    }
+  };
+  const ctx = makeExperimentContext({
+    PlaylistItems: {
+      list(part, options) {
+        assert.strictEqual(part, 'contentDetails');
+        assert.strictEqual(options.playlistId, targetPlaylistId);
+        pageTokens.push(options.pageToken);
+        if (!options.pageToken) {
+          return {nextPageToken: 'verification-page-2', items: [
+            {contentDetails: {videoId: 'CkmIANn_xZY'}},
+            {contentDetails: {videoId: unrelatedVideoId}}
+          ]};
+        }
+        assert.strictEqual(options.pageToken, 'verification-page-2');
+        return {items: [
+          {contentDetails: {videoId: 'SE7aCzUaUdY'}},
+          {contentDetails: {videoId: 'CkmIANn_xZY'}}
+        ]};
+      },
+      insert() { youtubeMutationCalls += 1; throw new Error('verification attempted insert'); },
+      remove() { youtubeMutationCalls += 1; throw new Error('verification attempted removal'); }
+    }
+  }, {Utilities: utilities});
+
+  const fingerprintBefore = ctx.sourceConfigurationFingerprint(sheet);
+  const report = JSON.parse(JSON.stringify(
+    ctx.verifyRow4PremiereExperimentTargetReadOnly(sheet)
+  ));
+  const fingerprintAfter = ctx.sourceConfigurationFingerprint(sheet);
+  const serialized = JSON.stringify(report);
+  const logged = ctx.__logs.join('\n');
+
+  assert.deepStrictEqual(pageTokens, [undefined, 'verification-page-2']);
+  assert.strictEqual(report.readOnly, true);
+  assert.strictEqual(report.mutationPerformed, false);
+  assert.strictEqual(report.targetReadComplete, true);
+  assert.strictEqual(report.targetUniqueVideoCount, 3);
+  assert.deepStrictEqual(report.membershipByVideoId, {
+    CkmIANn_xZY: true,
+    SE7aCzUaUdY: true,
+    Knnm5_rG89E: false
+  });
+  assert.strictEqual(report.blockingErrorCount, 0);
+  assert.strictEqual(report.warningCount, 0);
+  assert.strictEqual(report.sourceConfigurationHash, fingerprintBefore);
+  assert.strictEqual(fingerprintAfter, fingerprintBefore);
+  assert.strictEqual(sheetMutationCalls, 0);
+  assert.strictEqual(youtubeMutationCalls, 0);
+  [targetPlaylistId, sourceId].forEach(secret => {
+    assert.ok(!serialized.includes(secret), 'verification report leaked private ID: ' + secret);
+    assert.ok(!logged.includes(secret), 'verification log leaked private ID: ' + secret);
+  });
+  assert.ok(logged.includes('PREMIERE_EXPERIMENT_TARGET_VERIFICATION'));
+}
+
 function testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates() {
   const ids = Array.from({length: 55}, (_, i) => 'audit-video-' + i);
   const playlistPageTokens = [];
@@ -2001,9 +2504,14 @@ function testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates() {
     COMPLETED_LIVE: 1,
     UNKNOWN: 1
   });
-  assert.strictEqual(report.forbiddenCount, 3);
+  assert.strictEqual(report.admittedHeuristicCompletedBroadcastCount, 0);
+  assert.strictEqual(report.forbiddenCount, 1,
+    'only the definitively over-limit completed stream is permanently forbidden');
+  assert.strictEqual(report.withheldCount, 3,
+    'upcoming, active, and unknown items must remain retryable');
   assert.strictEqual(report.unknownCount, 1);
   assert.strictEqual(report.mutationPerformed, false);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 3);
   assert.strictEqual(removeCalls, 0, 'v5 target audit must remain inspect-only');
 }
 
@@ -2038,10 +2546,78 @@ function testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking() {
   assert.strictEqual(report.classifications.NORMAL_UPLOAD, 50);
   assert.strictEqual(report.classifications.UNKNOWN, 10);
   assert.strictEqual(report.unknownCount, 10);
+  assert.strictEqual(report.withheldCount, 10);
   assert.strictEqual(report.mutationPerformed, false);
   assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
   assert.strictEqual(ctx.currentRowStatus.errorCount, 1, 'audit read failure must block the checkpoint');
   assert.strictEqual(removeCalls, 0, 'even a failed v5 audit must not mutate the playlist');
+}
+
+function testStrictTargetAuditMetadataOmissionIsWithheldAndBlocking() {
+  let removeCalls = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        return {items: [
+          {id: 'playlist-item-returned', contentDetails: {videoId: 'audit-returned'}},
+          {id: 'playlist-item-omitted', contentDetails: {videoId: 'audit-omitted'}}
+        ]};
+      },
+      remove() { removeCalls += 1; }
+    },
+    Videos: {
+      list() {
+        return {items: [normalUpload('audit-returned', 'PT20M')]};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const report = JSON.parse(JSON.stringify(ctx.inspectTargetPlaylistStrict('PL_TARGET')));
+
+  assert.strictEqual(report.classifications.NORMAL_UPLOAD, 1);
+  assert.strictEqual(report.classifications.UNKNOWN, 1);
+  assert.strictEqual(report.unknownCount, 1);
+  assert.strictEqual(report.withheldCount, 1);
+  assert.strictEqual(report.forbiddenCount, 0);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1,
+    'a successful metadata response that omits an ID must block the audit checkpoint');
+  assert.strictEqual(removeCalls, 0);
+}
+
+function testTargetAuditDoesNotCountHeuristicCandidateAsForbidden() {
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        return {items: [
+          {id: 'item-normal', contentDetails: {videoId: 'normal'}},
+          {id: 'item-premiere', contentDetails: {videoId: 'premiere-like'}}
+        ]};
+      },
+      remove() { throw new Error('read-only audit must never remove'); }
+    },
+    Videos: {
+      list() {
+        return {items: [
+          normalUpload('normal', 'PT2H'),
+          completedBroadcast(
+            'premiere-like', 'PT1H8M1S', '2026-08-20T19:00:06Z', '2026-08-20T20:09:06Z'
+          )
+        ]};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const report = JSON.parse(JSON.stringify(ctx.inspectTargetPlaylistStrict('PL_TARGET')));
+
+  assert.strictEqual(report.classifications.NORMAL_UPLOAD, 1);
+  assert.strictEqual(report.classifications.COMPLETED_LIVE, 1);
+  assert.strictEqual(report.admittedHeuristicCompletedBroadcastCount, 1);
+  assert.strictEqual(report.forbiddenCount, 0);
+  assert.strictEqual(report.withheldCount, 0);
+  assert.strictEqual(report.mutationPerformed, false);
 }
 
 function testPreInsertRevalidationRejectsStateTransition() {
@@ -2070,7 +2646,186 @@ function testPreInsertRevalidationRejectsStateTransition() {
 
   assert.strictEqual(insertCalls, 0, 'a candidate that becomes upcoming before insertion must never be written');
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1,
+    'a transitional pre-insert state must retain the checkpoint');
   assert.ok(ctx.__logs.some(line => line.includes('pre-insert') && line.includes('UPCOMING')));
+}
+
+function testPreInsertRevalidationRejectsCompletedBroadcastOverLimit() {
+  let insertCalls = 0;
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [completedBroadcast(
+          'changed-to-long-completed',
+          'PT7H1M43S',
+          '2026-08-20T10:00:00Z',
+          '2026-08-20T17:11:48Z'
+        )]};
+      }
+    },
+    PlaylistItems: {insert() { insertCalls += 1; }}
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['changed-to-long-completed']);
+
+  assert.strictEqual(insertCalls, 0);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0,
+    'a proven over-limit completed stream is a known rejection, not a metadata failure');
+  assert.ok(ctx.__logs.some(line => line.includes('over_90_minute')));
+}
+
+function testPreInsertIncompleteCompletedBroadcastEvidenceIsBlocking() {
+  let insertCalls = 0;
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        return {items: [completedBroadcast(
+          'preinsert-missing-end',
+          'PT30M',
+          '2026-08-20T10:00:00Z',
+          undefined
+        )]};
+      }
+    },
+    PlaylistItems: {insert() { insertCalls += 1; }}
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['preinsert-missing-end']);
+
+  assert.strictEqual(insertCalls, 0);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1,
+    'incomplete pre-insert evidence must retain the checkpoint');
+}
+
+function testEligibleCompletedBroadcastSurvivesPreAndPostValidation() {
+  let metadataCalls = 0;
+  const inserted = [];
+  const removed = [];
+  const candidate = completedBroadcast(
+    'known-premiere', 'PT1H8M1S', '2026-08-20T19:00:06Z', '2026-08-20T20:09:06Z'
+  );
+  const ctx = makeContext({
+    Videos: {list() { metadataCalls += 1; return {items: [candidate]}; }},
+    PlaylistItems: {
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'playlist-item-premiere'};
+      },
+      remove(id) { removed.push(id); }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['known-premiere']);
+
+  assert.deepStrictEqual(inserted, ['known-premiere']);
+  assert.deepStrictEqual(removed, []);
+  assert.strictEqual(metadataCalls, 2);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
+}
+
+function testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks() {
+  let metadataCall = 0;
+  const inserted = [];
+  const removed = [];
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        metadataCall += 1;
+        if (metadataCall === 1) {
+          return {items: [completedBroadcast(
+            'postinsert-missing-end',
+            'PT30M',
+            '2026-08-20T10:00:00Z',
+            '2026-08-20T10:30:00Z'
+          )]};
+        }
+        return {items: [completedBroadcast(
+          'postinsert-missing-end',
+          'PT30M',
+          '2026-08-20T10:00:00Z',
+          undefined
+        )]};
+      }
+    },
+    PlaylistItems: {
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'playlist-item-missing-end'};
+      },
+      remove(id) { removed.push(id); }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['postinsert-missing-end']);
+
+  assert.deepStrictEqual(inserted, ['postinsert-missing-end']);
+  assert.deepStrictEqual(removed, ['playlist-item-missing-end']);
+  assert.strictEqual(metadataCall, 2);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 1,
+    'an incomplete post-insert state must roll back and retain the checkpoint');
+}
+
+function testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack() {
+  let metadataCall = 0;
+  const inserted = [];
+  const removed = [];
+  const ctx = makeContext({
+    Videos: {
+      list() {
+        metadataCall += 1;
+        if (metadataCall === 1) {
+          return {items: [completedBroadcast(
+            'grows-after-insert', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T11:00:00Z'
+          )]};
+        }
+        return {items: [completedBroadcast(
+          'grows-after-insert', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T12:00:00Z'
+        )]};
+      }
+    },
+    PlaylistItems: {
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'playlist-item-growing-stream'};
+      },
+      remove(id) { removed.push(id); }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+  ctx.targetPlaylistVideoCache = {'PL_TARGET': {}};
+  ctx.maxPlaylistWriteOperationsPerRun = 10;
+  ctx.playlistWriteOperationsUsed = 0;
+
+  ctx.addVideosToPlaylist('PL_TARGET', ['grows-after-insert']);
+
+  assert.deepStrictEqual(inserted, ['grows-after-insert']);
+  assert.deepStrictEqual(removed, ['playlist-item-growing-stream']);
+  assert.strictEqual(metadataCall, 2);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
+  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
 }
 
 function testPostInsertTransitionIsRolledBack() {
@@ -2111,7 +2866,9 @@ function testPostInsertTransitionIsRolledBack() {
   assert.deepStrictEqual(removed, ['playlist-item-1']);
   assert.strictEqual(metadataCall, 2, 'the inserted item must be checked both before and after insertion');
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
-  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 0);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1,
+    'a transitional post-insert state must roll back and retain the checkpoint');
   assert.strictEqual(ctx.targetPlaylistVideoCache.PL_TARGET['changed-after-insert'], undefined);
 }
 
@@ -3035,6 +3792,7 @@ const tests = [
   testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp,
   testMissingUploadsPlaylistWarnsHealthyInsertAndAdvancesTimestamp,
   testTransientSourceErrorStillBlocksCheckpoint,
+  testTransitionalBroadcastsRetainFullRowCheckpoint,
   testInvalidCheckpointTimestampBlocksBeforeAnyApiOrWrite,
   testAggregateRowFailureDoesNotStopLaterRowCheckpoint,
   testDebugSetupFailuresDoNotBlockValidPlaylistRows,
@@ -3050,23 +3808,37 @@ const tests = [
   testExperimentAllSubscriptionFailuresAndMalformedItemsAreBlocking,
   testExperimentMissingTargetReadIsBlocking,
   testExperimentMalformedTargetItemBlocksReplayCheckpoint,
+  testExperimentReplayRetainsCheckpointForTransitionalBroadcasts,
   testExperimentVideoMetadata404IsBlocking,
   testExperimentVideoMetadataBatchesOmitUnsupportedMaxResults,
   testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
   testStrictClassificationOracle,
-  testStrictFilterKeepsOnlyNormalUploads,
+  testPremiereExperimentDurationParserAndAdmissionBoundary,
+  testPremiereExperimentGoldenCorpusAdmissionFixture,
+  testStrictYoutubeTimestampGrammarAndExperimentParity,
+  testPremiereExperimentFilterUsesSharedAdmissionDecision,
+  testCompletedBroadcastMissingOrInvalidEvidenceIsFailClosed,
   testConstructorVideoIdSurvivesDedupeAndStrictFilter,
   testUnknownMetadataIsFailClosedAndBlocksCheckpoint,
   testSuccessfulMetadataResponseOmissionIsWithheld,
   testStrictShortFilterRemainsIndependent,
   testFilterBatchFailureDoesNotCancelLaterBatch,
   testVideoMetadataUsesOneRequestPerFiftyIds,
+  testExperimentAdmissionFallbackMatchesProductionPolicy,
   testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists,
   testExperimentReplaySummaryStaysBelowAppsScriptLogLimit,
   testTargetAccessDiagnosticIsReadOnlyTrimmedHashedAndSourceStable,
+  testPremiereExperimentTargetVerificationIsExactReadOnlyAndPrivate,
   testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates,
   testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking,
+  testStrictTargetAuditMetadataOmissionIsWithheldAndBlocking,
+  testTargetAuditDoesNotCountHeuristicCandidateAsForbidden,
   testPreInsertRevalidationRejectsStateTransition,
+  testPreInsertRevalidationRejectsCompletedBroadcastOverLimit,
+  testPreInsertIncompleteCompletedBroadcastEvidenceIsBlocking,
+  testEligibleCompletedBroadcastSurvivesPreAndPostValidation,
+  testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks,
+  testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack,
   testPostInsertTransitionIsRolledBack,
   testFirstTargetPageFailureBlocksWithoutProbesOrInserts,
   testPartialTargetReadUsesCandidateProbesAndContinues,

@@ -1,4 +1,4 @@
-# V5.3 experiment helper integration
+# V5.4-exp1 experiment helper integration
 
 `apps-script/Experiment.gs` is designed to be added to the same Apps Script
 project as `sheetScript.gs`. It provides read-only evidence helpers; it is not a
@@ -14,20 +14,25 @@ second production updater.
   value, formula, row bound, or column bound changed.
 - `replayRow4StrictDryRun()` and `replayRow5StrictDryRun()` call
   `replayStrictDryRun(rowNumber)`. The generic replay reads the existing column-B
-  timestamp, discovers candidates, classifies them, reads the target for a write
-  plan, and emits one `STRICT_REPLAY_RESULT` JSON log line.
+  timestamp, discovers candidates, applies the completed-Premiere experiment,
+  reads the target for a write plan, and emits one
+  `PREMIERE_EXPERIMENT_REPLAY_RESULT` JSON log line.
 - `diagnoseRow4TargetAccessReadOnly()` and `diagnoseTargetAccessReadOnly()` verify
   the authorized YouTube identity, exact target lookup, ownership visibility,
   first-item access, and full pagination without mutating the playlist or sheet.
   IDs are hashed before logging.
+- `verifyRow4PremiereExperimentTargetReadOnly()` fully paginates row 4's target
+  and reports its unique-video count plus exact membership booleans for the
+  three public experiment videos. The raw target and source IDs are never
+  returned or logged, and the source fingerprint is checked before and after.
 
 The structured replay result contains video IDs because the experiment protocol
 compares candidates by ID. It contains source hashes and source column numbers,
 but never channel IDs or source-playlist IDs.
 
 Large forensic payloads can exceed Apps Script's per-line log display. The helper
-therefore emits a compact `STRICT_REPLAY_SUMMARY` first, followed by the complete
-`STRICT_REPLAY_RESULT` payload.
+therefore emits a compact `PREMIERE_EXPERIMENT_REPLAY_SUMMARY` first, followed by
+the complete `PREMIERE_EXPERIMENT_REPLAY_RESULT` payload.
 
 ## Main-code assumptions
 
@@ -37,13 +42,14 @@ therefore emits a compact `STRICT_REPLAY_SUMMARY` first, followed by the complet
 - Rows start at 4, the timestamp is in B, the shorts switch is in E, and sources
   begin in G. These are the same reserved positions used by the current script.
 - The Advanced YouTube Data API service is enabled.
-- When the main script's pure `classifyVideoStrict()` and
-  `isLessThanThreeMinutes()` functions exist, the replay calls them so the live
-  oracle and short-video behavior stay identical. Local fallbacks make the
-  experiment file independently testable.
-- Strict broadcast classification is intentionally independent of V4's
-  duration-based `passesLiveLikeFilter()`: column F is read by neither the strict
-  classifier nor the source reader.
+- When the main script's pure `classifyVideoStrict()`, shared
+  `evaluateVideoAdmissionPolicy()`, and `isLessThanThreeMinutes()` functions
+  exist, the replay delegates to them. Equivalent local fallbacks make the
+  experiment file independently testable and are covered by parity tests.
+- Factual broadcast classification remains independent of duration. Only the
+  separate experiment evaluator uses the larger of playback duration and actual
+  start-to-end interval with a hardcoded inclusive 5,400-second limit. Column F
+  is read by neither the evaluator nor the source reader.
 - `videos.list` is batched at 50 IDs. Its `id` requests deliberately omit
   `maxResults`, which the API does not support together with `id`. Missing,
   malformed, omitted, or failed metadata is withheld and makes
@@ -79,7 +85,8 @@ column-B timestamp and must remain safe even if the production pipeline changes.
 per-ID write plan needed here, so the helper performs its own read-only target
 scan. It contains no `setValue`, `setValues`, `insert`, or `delete` operation.
 Target access is only `playlistItems.list`, used to calculate
-`alreadyPresentIds` and `wouldInsertIds`.
+`alreadyPresentIds`, `wouldInsertIds`, and the explicit read-only experiment
+membership proof.
 
 Run `snapshotExperimentRows()` before testing, retain its
 `sourceConfigurationHash`, and call
