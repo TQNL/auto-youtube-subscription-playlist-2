@@ -25,12 +25,16 @@ recovery would require a checkpoint (or disabled-state record) for each source
 rather than one timestamp for the entire row. V5.3 does not remove broadcasts
 inserted by older versions; historical cleanup remains separately authorized.
 
-Promotion remains pending. The latest candidate has 60 local regressions plus
-14 legacy regressions, but YouTube quota prevented the required exact row-5
-Premiere replay after the final defensive hardening. A malformed insert response
-without a playlist-item ID is reconciled and rolled back when one exact handle is
-recoverable; zero or multiple matches remain a manual-review condition because
-V5.3 does not yet have a durable cross-execution mutation journal.
+The final hardened candidate has 60 local regressions plus 14 legacy
+regressions and passed the exact row-5 Premiere replay on 2026-08-22. The
+read-only replay and the production path both acquired `CkmIANn_xZY`, classified
+it as `COMPLETED_LIVE`, and admitted zero videos; the production checkpoint
+advanced while the protected G+ source fingerprints remained unchanged. The
+promoted evidence boundary is tagged `candidate/strict-ingestion-v5.3`. A
+malformed insert response without a playlist-item ID is reconciled and rolled
+back when one exact handle is recoverable; zero or multiple matches remain a
+manual-review condition because V5.3 does not yet have a durable
+cross-execution mutation journal.
 
 This is done using Google Sheets for interface, Google Script + Youtube API v3 for executing and scheduling.
 

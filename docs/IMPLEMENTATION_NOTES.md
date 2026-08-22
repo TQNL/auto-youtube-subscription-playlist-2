@@ -125,9 +125,19 @@ arrived after 28 pages, but that partial inventory already contained all 41
 candidates, so V5.3 inserted 0, skipped 41, and advanced row 4 to
 `2026-08-21T22:43:52+00:00`. Row 5 then encountered a metadata quota error,
 failed closed, and retained its historical checkpoint. No playlist item was
-deleted. Subsequent quota-independent hardening was validated locally but has
-not received an exact final row-5 production replay. The regression suite passes
-60 of 60 current tests plus 14 of 14 legacy regressions. It forces DebugData
+deleted.
+
+After quota reset, the exact hardened candidate at `a1a6306` received a final
+row-5 validation. The read-only replay acquired `CkmIANn_xZY`, rejected it as
+`COMPLETED_LIVE`, reported zero admissible IDs and zero warnings/errors, and
+would advance the checkpoint. The production `updatePlaylists` path then
+repeated that classification, left zero videos, inserted nothing, and advanced
+B5 from `2026-08-19T10:25:04+00:00` to
+`2026-08-22T09:26:43+00:00`. Row 4 was made not due through a temporary C4
+frequency guard, then C4 was restored to blank. A post-run snapshot proved B4
+unchanged and the full, row-4, and row-5 G+ source fingerprints identical to
+their protected baselines. The regression suite passes 60 of 60 current tests
+plus 14 of 14 legacy regressions. It forces DebugData
 creation, scanning, per-row writes, viewer initialization, summary writes, and
 the Apps Script Logger itself to fail, proving that observability cannot stop a
 later row, alter accounting, mask the aggregate error, or preempt rollback. When

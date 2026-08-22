@@ -9,8 +9,10 @@ IDs in this repository.
 1. Never edit the source cells: column G and every column to its right.
 2. Before and after an experiment, compute the SHA-256 source fingerprint exposed
    by `sourceConfigurationFingerprint()` and require an exact match.
-3. Record the original timestamp cells before changing them, and restore them
-   after each candidate run.
+3. Record timestamp cells before any deliberate replay-window edit. Restore them
+   after read-only candidate replays. After an accepted production validation,
+   retain the checkpoint written by production and record its before/after
+   values; rewinding it could cause already-processed work to be retried.
 4. Run the non-mutating replay first. Do not insert or delete playlist items until
    the candidate classifications and write plan have been reviewed.
 5. A metadata read failure is fail-closed: affected videos are not inserted and
@@ -39,7 +41,9 @@ For every candidate revision:
    agree with the documented policy.
 
 The replay helpers never update timestamps or playlists. Production execution is
-tested separately after the dry-run evidence is accepted.
+tested separately after the dry-run evidence is accepted. A production run's
+checkpoint is evidence and is not reset merely to recreate the historical test
+window.
 
 ## Classification oracle
 
