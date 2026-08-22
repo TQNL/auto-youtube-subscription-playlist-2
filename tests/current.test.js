@@ -2586,6 +2586,48 @@ function testStrictTargetAuditMetadataOmissionIsWithheldAndBlocking() {
   assert.strictEqual(removeCalls, 0);
 }
 
+function testStrictTargetAuditMalformedPlaylistItemsAreWithheldAndBlocking() {
+  const metadataRequests = [];
+  let removeCalls = 0;
+  const ctx = makeContext({
+    PlaylistItems: {
+      list() {
+        return {items: [
+          {id: 'playlist-item-valid-1', contentDetails: {videoId: 'audit-valid'}},
+          {id: 'playlist-item-valid-duplicate', contentDetails: {videoId: 'audit-valid'}},
+          {id: 'playlist-item-missing-video-id', contentDetails: {}},
+          {id: 'playlist-item-blank-video-id', contentDetails: {videoId: '   '}}
+        ]};
+      },
+      remove() { removeCalls += 1; }
+    },
+    Videos: {
+      list(part, options) {
+        metadataRequests.push(options.id);
+        return {items: [normalUpload('audit-valid', 'PT20M')]};
+      }
+    }
+  });
+  ctx.currentRowStatus = ctx.createRowStatus();
+
+  const report = JSON.parse(JSON.stringify(ctx.inspectTargetPlaylistStrict('PL_TARGET')));
+
+  assert.deepStrictEqual(metadataRequests, ['audit-valid'],
+    'duplicate valid IDs must retain the existing de-duplication behavior');
+  assert.strictEqual(report.playlistItemCount, 4);
+  assert.strictEqual(report.uniqueVideoCount, 1);
+  assert.strictEqual(report.unidentifiedPlaylistItemCount, 2);
+  assert.strictEqual(report.classifications.NORMAL_UPLOAD, 1);
+  assert.strictEqual(report.classifications.UNKNOWN, 2);
+  assert.strictEqual(report.unknownCount, 2);
+  assert.strictEqual(report.withheldCount, 2);
+  assert.strictEqual(report.forbiddenCount, 0);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 2,
+    'each malformed target item must record its own blocking policy error');
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 2);
+  assert.strictEqual(removeCalls, 0);
+}
+
 function testTargetAuditDoesNotCountHeuristicCandidateAsForbidden() {
   const ctx = makeContext({
     PlaylistItems: {
@@ -3832,6 +3874,7 @@ const tests = [
   testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates,
   testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking,
   testStrictTargetAuditMetadataOmissionIsWithheldAndBlocking,
+  testStrictTargetAuditMalformedPlaylistItemsAreWithheldAndBlocking,
   testTargetAuditDoesNotCountHeuristicCandidateAsForbidden,
   testPreInsertRevalidationRejectsStateTransition,
   testPreInsertRevalidationRejectsCompletedBroadcastOverLimit,
