@@ -2,52 +2,42 @@
 This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
 
 > **TQNL reliability fork:** development in this fork is strict and evidence-led.
-> This experiment branch derives `sheetScript.gs` from the signed-off V5.3
-> production candidate; the proven experiment snapshot is
-> [`versions/v5.4-exp1-premiere-under-90m.gs`](./versions/v5.4-exp1-premiere-under-90m.gs),
-> selected earlier iterations are in [`versions/`](./versions), and the experiment
-> procedure is documented in
-> [`docs/EXPERIMENT_PROTOCOL.md`](./docs/EXPERIMENT_PROTOCOL.md), and the deliberate
-> Premiere/livestream tradeoffs are documented in
-> [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md) and
+> The current `sheetScript.gs` candidate is V5.5 strict broadcast rejection.
+> Immutable earlier revisions, including the retired 90-minute Premiere
+> experiment, remain in [`versions/`](./versions). The active invariant is
+> documented in [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md); historical
+> experiment evidence remains in
 > [`docs/PREMIERE_90M_EXPERIMENT.md`](./docs/PREMIERE_90M_EXPERIMENT.md).
 
-The current branch is a live-validated, unpromoted Premiere experiment. Upcoming
-and active broadcasts remain rejected from insertion and retain the row
-checkpoint for a completion retry. A completed broadcast-like item is admitted
-only as a heuristic candidate when the larger of its playback duration and
-actual start-to-end interval is at most a hardcoded 90 minutes. Column F is kept
-only so existing sheets retain their layout and does not configure this rule. A
-genuine completed livestream under 90 minutes can still pass, because the public
-API has no reliable completed-Premiere discriminator; use V5.3 when preventing
-every detectable completed broadcast is more important than retaining
-Premieres.
-The strict V5.3 production evidence is recorded in
-[`docs/LIVE_VALIDATION_2026-08-21.md`](./docs/LIVE_VALIDATION_2026-08-21.md).
-The separate 2026-08-22 experiment record proves that the prepared completed
-Premiere was inserted while both prepared over-limit completed livestreams
-remained absent, without changing the protected source configuration:
-[`docs/LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md`](./docs/LIVE_VALIDATION_2026-08-22_PREMIERE_EXPERIMENT.md).
+V5.5 allows only videos whose documented broadcast state is `none` and whose
+resource has no `liveStreamingDetails`. Upcoming, active, and completed
+broadcast-like videos are rejected regardless of duration. This deliberately
+rejects detectable completed Premieres too: the public API exposes no reliable
+completed-Premiere discriminator, and this version chooses no known livestream
+false positives over retaining Premieres. Ordinary long uploads remain
+eligible. Column F is reserved and ignored.
 
-V5.3 also isolates source availability from filtering and insertion state. A
+Known broadcast rejections are non-blocking, so they do not freeze the row-wide
+timestamp. Missing, malformed, omitted, or failed metadata remains fail-closed
+and keeps the checkpoint for retry. The policy is applied during filtering,
+immediately before insertion, and after insertion with rollback protection.
+
+V5.5 retains the V5.3/V5.4 source-isolation and insertion safeguards. A
 permanently missing playlist on the first page of a source read is logged as a
 warning so other healthy sources can complete; a later-page source failure, or a
 target/filter error that leaves work unresolved, retains the row checkpoint. The
 first-page exception is a deliberate liveness tradeoff. Fully lossless source
 recovery would require a checkpoint (or disabled-state record) for each source
-rather than one timestamp for the entire row. V5.3 does not remove broadcasts
+rather than one timestamp for the entire row. V5.5 does not remove broadcasts
 inserted by older versions; historical cleanup remains separately authorized.
 
-The final hardened candidate has 60 local regressions plus 14 legacy
-regressions and passed the exact row-5 Premiere replay on 2026-08-22. The
-read-only replay and the production path both acquired `CkmIANn_xZY`, classified
-it as `COMPLETED_LIVE`, and admitted zero videos; the production checkpoint
-advanced while the protected G+ source fingerprints remained unchanged. The
-promoted evidence boundary is tagged `candidate/strict-ingestion-v5.3`. A
-malformed insert response without a playlist-item ID is reconciled and rolled
-back when one exact handle is recoverable; zero or multiple matches remain a
-manual-review condition because V5.3 does not yet have a durable
-cross-execution mutation journal.
+The earlier strict V5.3 production evidence is recorded in
+[`docs/LIVE_VALIDATION_2026-08-21.md`](./docs/LIVE_VALIDATION_2026-08-21.md).
+The 2026-08-22 Premiere experiment record is preserved as historical evidence,
+not as current policy. A malformed insert response without a playlist-item ID
+is reconciled and rolled back when one exact handle is recoverable; zero or
+multiple matches remain a manual-review condition because the script does not
+yet have a durable cross-execution mutation journal.
 
 This is done using Google Sheets for interface, Google Script + Youtube API v3 for executing and scheduling.
 

@@ -3,7 +3,27 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
-## Completed-Premiere heuristic experiment (live-validated, unpromoted)
+## V5.5 strict broadcast rejection (candidate)
+
+- Retires the 90-minute completed-broadcast exception. Duration no longer
+  influences broadcast admission; ordinary long uploads remain eligible.
+- Allows only factual `NORMAL_UPLOAD` resources. `UPCOMING`, `ACTIVE`, and
+  `COMPLETED_LIVE` are deterministic, non-blocking rejections. This intentionally
+  rejects detectable completed Premieres because the public API cannot reliably
+  distinguish them from completed livestreams.
+- Keeps `UNKNOWN`, missing, malformed, omitted, and failed metadata blocking and
+  fail-closed so an unresolved candidate retains the row checkpoint.
+- Applies the same decision at the initial batch filter, pre-insert validation,
+  post-insert rollback, untracked-insert review, target audit, and read-only
+  replay helper.
+- Retains V5.4 reliability hardening: per-source error isolation, 50-ID metadata
+  batching, exact target-membership probes, malformed-target handling, write
+  budgets, and reserved rollback capacity.
+- Trigger objects are operational deployment state, not repository state. Live
+  trigger replacement and cadence verification are recorded separately from the
+  source snapshot.
+
+## Completed-Premiere heuristic experiment (retired, live-validated, unpromoted)
 
 - `v5.4-exp1-premiere-under-90m.gs` is the immutable, line-ending-normalized
   snapshot of the live-validated `sheetScript.gs` source from deployed commit

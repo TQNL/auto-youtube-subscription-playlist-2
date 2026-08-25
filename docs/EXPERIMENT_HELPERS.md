@@ -1,4 +1,4 @@
-# V5.4-exp1 experiment helper integration
+# V5.5 strict-policy helper integration
 
 `apps-script/Experiment.gs` is designed to be added to the same Apps Script
 project as `sheetScript.gs`. It provides read-only evidence helpers; it is not a
@@ -14,25 +14,27 @@ second production updater.
   value, formula, row bound, or column bound changed.
 - `replayRow4StrictDryRun()` and `replayRow5StrictDryRun()` call
   `replayStrictDryRun(rowNumber)`. The generic replay reads the existing column-B
-  timestamp, discovers candidates, applies the completed-Premiere experiment,
-  reads the target for a write plan, and emits one
+  timestamp, discovers candidates, applies strict broadcast rejection, reads the
+  target for a write plan, and emits one compatibility-named
   `PREMIERE_EXPERIMENT_REPLAY_RESULT` JSON log line.
 - `diagnoseRow4TargetAccessReadOnly()` and `diagnoseTargetAccessReadOnly()` verify
   the authorized YouTube identity, exact target lookup, ownership visibility,
   first-item access, and full pagination without mutating the playlist or sheet.
   IDs are hashed before logging.
-- `verifyRow4PremiereExperimentTargetReadOnly()` fully paginates row 4's target
-  and reports its unique-video count plus exact membership booleans for the
-  three public experiment videos. The raw target and source IDs are never
-  returned or logged, and the source fingerprint is checked before and after.
+- `verifyRow4PremiereExperimentTargetReadOnly()` is retained as a historical,
+  read-only corpus helper. It fully paginates row 4's target and reports exact
+  membership booleans for the three public experiment videos. It does not define
+  current admission policy.
 
 The structured replay result contains video IDs because the experiment protocol
 compares candidates by ID. It contains source hashes and source column numbers,
 but never channel IDs or source-playlist IDs.
 
-Large forensic payloads can exceed Apps Script's per-line log display. The helper
-therefore emits a compact `PREMIERE_EXPERIMENT_REPLAY_SUMMARY` first, followed by
-the complete `PREMIERE_EXPERIMENT_REPLAY_RESULT` payload.
+Large forensic payloads can exceed Apps Script's per-line log display. For
+backward compatibility, the helper still emits a compact
+`PREMIERE_EXPERIMENT_REPLAY_SUMMARY` first, followed by the complete
+`PREMIERE_EXPERIMENT_REPLAY_RESULT` payload. The result's `policy` field is
+`strict-documented-broadcast-markers-v1`.
 
 ## Main-code assumptions
 
@@ -46,10 +48,10 @@ the complete `PREMIERE_EXPERIMENT_REPLAY_RESULT` payload.
   `evaluateVideoAdmissionPolicy()`, and `isLessThanThreeMinutes()` functions
   exist, the replay delegates to them. Equivalent local fallbacks make the
   experiment file independently testable and are covered by parity tests.
-- Factual broadcast classification remains independent of duration. Only the
-  separate experiment evaluator uses the larger of playback duration and actual
-  start-to-end interval with a hardcoded inclusive 5,400-second limit. Column F
-  is read by neither the evaluator nor the source reader.
+- Factual broadcast classification and admission are independent of duration.
+  `NORMAL_UPLOAD` is allowed; `UPCOMING`, `ACTIVE`, and `COMPLETED_LIVE` are
+  non-blocking rejections; `UNKNOWN` is withheld and blocking. Column F is read
+  by neither the evaluator nor the source reader.
 - `videos.list` is batched at 50 IDs. Its `id` requests deliberately omit
   `maxResults`, which the API does not support together with `id`. Missing,
   malformed, omitted, or failed metadata is withheld and makes

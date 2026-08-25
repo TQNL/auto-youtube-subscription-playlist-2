@@ -284,11 +284,37 @@ function testTransientSourceErrorStillBlocksCheckpoint() {
   assert.strictEqual(ctx.currentRowStatus.timestampUpdated, false);
 }
 
-function testTransitionalBroadcastsRetainFullRowCheckpoint() {
-  const candidateIds = ['scheduled-premiere', 'active-premiere'];
+function testMixedKnownBroadcastsRejectNormalUploadInsertsAndCheckpointAdvances() {
+  const candidateIds = [
+    'ordinary-long-upload',
+    'scheduled-premiere',
+    'active-livestream',
+    'short-completed-broadcast'
+  ];
   let timestampWrites = 0;
   let targetReads = 0;
-  let insertCalls = 0;
+  const inserted = [];
+  const metadata = {
+    'ordinary-long-upload': normalUpload('ordinary-long-upload', 'PT3H'),
+    'scheduled-premiere': {
+      id: 'scheduled-premiere',
+      snippet: {liveBroadcastContent: 'upcoming'},
+      contentDetails: {duration: 'P0D'},
+      liveStreamingDetails: {scheduledStartTime: '2026-08-22T16:00:00Z'}
+    },
+    'active-livestream': {
+      id: 'active-livestream',
+      snippet: {liveBroadcastContent: 'live'},
+      contentDetails: {duration: 'P0D'},
+      liveStreamingDetails: {actualStartTime: '2026-08-21T20:00:00Z'}
+    },
+    'short-completed-broadcast': completedBroadcast(
+      'short-completed-broadcast',
+      'PT30M',
+      '2026-08-21T18:00:00Z',
+      '2026-08-21T18:30:00Z'
+    )
+  };
   const ctx = makeContext({
     Channels: {
       list() {
@@ -300,7 +326,7 @@ function testTransitionalBroadcastsRetainFullRowCheckpoint() {
         if (options.playlistId === 'UU_TRANSITIONAL') {
           return {items: candidateIds.map((videoId, index) => ({contentDetails: {
             videoId,
-            videoPublishedAt: '2026-08-21T0' + (index + 8) + ':00:00Z'
+            videoPublishedAt: '2026-08-21T' + String(index + 8).padStart(2, '0') + ':00:00Z'
           }}))};
         }
         if (options.playlistId === 'PL_TARGET_12345') {
@@ -309,24 +335,14 @@ function testTransitionalBroadcastsRetainFullRowCheckpoint() {
         }
         throw new Error('unexpected playlist lookup ' + options.playlistId + ' / ' + part);
       },
-      insert() { insertCalls += 1; }
+      insert(resource) {
+        inserted.push(resource.snippet.resourceId.videoId);
+        return {id: 'playlist-item-normal'};
+      }
     },
     Videos: {
-      list() {
-        return {items: [
-          {
-            id: candidateIds[0],
-            snippet: {liveBroadcastContent: 'upcoming'},
-            contentDetails: {duration: 'P0D'},
-            liveStreamingDetails: {scheduledStartTime: '2026-08-22T16:00:00Z'}
-          },
-          {
-            id: candidateIds[1],
-            snippet: {liveBroadcastContent: 'live'},
-            contentDetails: {duration: 'P0D'},
-            liveStreamingDetails: {actualStartTime: '2026-08-21T20:00:00Z'}
-          }
-        ]};
+      list(part, options) {
+        return {items: options.id.split(',').map(videoId => metadata[videoId])};
       }
     }
   });
@@ -348,13 +364,14 @@ function testTransitionalBroadcastsRetainFullRowCheckpoint() {
   ctx.playlistWriteOperationsUsed = 0;
   ctx.processPlaylistRow(sheet, data, 3, 'PL_TARGET_12345');
 
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, 2);
-  assert.strictEqual(ctx.currentRowStatus.errorCount, 2);
-  assert.strictEqual(timestampWrites, 0,
-    'scheduled/live candidates must retain the row checkpoint for completion retry');
-  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, false);
-  assert.strictEqual(targetReads, 0, 'no empty candidate set should trigger a target read');
-  assert.strictEqual(insertCalls, 0);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
+  assert.strictEqual(timestampWrites, 1,
+    'known broadcast states are permanent strict rejections and must not freeze the row');
+  assert.strictEqual(ctx.currentRowStatus.timestampUpdated, true);
+  assert.strictEqual(targetReads, 1);
+  assert.deepStrictEqual(inserted, ['ordinary-long-upload'],
+    'ordinary long uploads remain eligible while every known broadcast state is rejected');
 }
 
 function testInvalidCheckpointTimestampBlocksBeforeAnyApiOrWrite() {
@@ -1228,7 +1245,7 @@ function testExperimentMalformedTargetItemBlocksReplayCheckpoint() {
   assert.strictEqual(result.issues[0].reason, 'target_playlist_item_metadata_invalid');
 }
 
-function testExperimentReplayRetainsCheckpointForTransitionalBroadcasts() {
+function testExperimentReplayRejectsKnownBroadcastsWithoutBlockingCheckpoint() {
   const targetPlaylistId = 'PL_REPLAY_TARGET';
   const sourcePlaylistId = 'PL_REPLAY_SOURCE';
   const candidateIds = ['replay-upcoming', 'replay-active'];
@@ -1308,14 +1325,17 @@ function testExperimentReplayRetainsCheckpointForTransitionalBroadcasts() {
 
   assert.deepStrictEqual(Array.from(result.acquiredCandidateIds), candidateIds);
   assert.deepStrictEqual(Array.from(result.keptCandidateIds), []);
-  assert.deepStrictEqual(Array.from(result.rejectedCandidates), []);
   assert.deepStrictEqual(
-    Array.from(result.withheldCandidates, candidate => candidate.reason),
-    ['upcoming_broadcast', 'active_broadcast']
+    Array.from(result.rejectedCandidates, candidate => candidate.reason),
+    [
+      'upcoming_broadcast_rejected_by_strict_policy',
+      'active_broadcast_rejected_by_strict_policy'
+    ]
   );
-  assert.strictEqual(result.blockingErrorCount, 2);
-  assert.strictEqual(result.checkpointWouldAdvance, false,
-    'dry-run replay must predict a retained checkpoint for scheduled/live candidates');
+  assert.deepStrictEqual(Array.from(result.withheldCandidates), []);
+  assert.strictEqual(result.blockingErrorCount, 0);
+  assert.strictEqual(result.checkpointWouldAdvance, true,
+    'known broadcasts are permanent strict rejections, not retryable metadata failures');
   assert.strictEqual(result.targetReadComplete, true);
   assert.deepStrictEqual(Array.from(result.wouldInsertIds), []);
 }
@@ -1484,63 +1504,35 @@ function testStrictClassificationOracle() {
   }), 'UNKNOWN');
 }
 
-function testPremiereExperimentDurationParserAndAdmissionBoundary() {
+function testStrictAdmissionRejectsEveryKnownBroadcastWithoutDurationException() {
   const ctx = makeContext();
-  const durationCases = [
-    ['PT1H8M1S', 4081],
-    ['PT1H30M', 5400],
-    ['PT90M', 5400],
-    ['PT5400S', 5400],
-    ['P1D', 86400],
-    ['P0DT1H30M0.001S', 5400.001],
-    ['P', null],
-    ['PT', null],
-    ['P0D', 0],
-    ['-PT1H', null],
-    ['01:30:00', null],
-    ['P1M', null]
+  const cases = [
+    [normalUpload('ordinary-long', 'PT12H'), true, false, 'normal_upload'],
+    [{id: 'scheduled', snippet: {liveBroadcastContent: 'upcoming'}}, false, false,
+      'upcoming_broadcast_rejected_by_strict_policy'],
+    [{id: 'active', snippet: {liveBroadcastContent: 'live'}}, false, false,
+      'active_broadcast_rejected_by_strict_policy'],
+    [completedBroadcast(
+      'short-completed', 'PT1M', '2026-08-20T10:00:00Z', '2026-08-20T10:01:00Z'
+    ), false, false, 'completed_broadcast_rejected_by_strict_policy'],
+    [completedBroadcast(
+      'long-completed', 'PT12H', '2026-08-20T10:00:00Z', '2026-08-20T22:00:00Z'
+    ), false, false, 'completed_broadcast_rejected_by_strict_policy'],
+    [{id: 'unknown', snippet: {liveBroadcastContent: 'unexpected'}}, false, true,
+      'live_state_missing_or_unknown']
   ];
-  durationCases.forEach(([duration, expected]) => {
-    assert.strictEqual(ctx.parseIso8601DurationSeconds(duration), expected, duration);
+
+  cases.forEach(([item, allowed, blocking, reason]) => {
+    const decision = ctx.evaluateVideoAdmissionPolicy(item);
+    assert.strictEqual(decision.allowed, allowed, item.id);
+    assert.strictEqual(decision.blocking, blocking, item.id);
+    assert.strictEqual(decision.reason, reason, item.id);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(decision, 'effectiveDurationSeconds'), false,
+      'strict admission must not consult duration: ' + item.id);
   });
-
-  const premiereDecision = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
-    'CkmIANn_xZY', 'PT1H8M1S', '2026-08-20T19:00:06Z', '2026-08-20T20:09:06Z'
-  ));
-  assert.strictEqual(premiereDecision.allowed, true);
-  assert.strictEqual(premiereDecision.blocking, false);
-  assert.strictEqual(premiereDecision.classification, 'COMPLETED_LIVE');
-  assert.strictEqual(premiereDecision.admissionClass, 'HEURISTIC_PREMIERE_CANDIDATE');
-  assert.strictEqual(premiereDecision.contentDurationSeconds, 4081);
-  assert.strictEqual(premiereDecision.actualDurationSeconds, 4140);
-  assert.strictEqual(premiereDecision.effectiveDurationSeconds, 4140);
-
-  const exactBoundary = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
-    'exact-boundary', 'PT1H30M', '2026-08-20T10:00:00Z', '2026-08-20T11:30:00Z'
-  ));
-  assert.strictEqual(exactBoundary.allowed, true, 'the 5,400-second boundary is inclusive');
-
-  const fractionOver = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
-    'fraction-over', 'PT1H30M0.001S', '2026-08-20T10:00:00Z', '2026-08-20T11:30:00Z'
-  ));
-  assert.strictEqual(fractionOver.allowed, false, 'the boundary must not be rounded');
-  assert.strictEqual(fractionOver.blocking, false);
-
-  const trimmedLongStream = ctx.evaluateVideoAdmissionPolicy(completedBroadcast(
-    'trimmed-long-stream', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T12:00:00Z'
-  ));
-  assert.strictEqual(trimmedLongStream.allowed, false,
-    'actual elapsed time must catch a long stream whose replay was trimmed below 90 minutes');
-  assert.strictEqual(trimmedLongStream.effectiveDurationSeconds, 7200);
-
-  assert.strictEqual(
-    ctx.evaluateVideoAdmissionPolicy(normalUpload('ordinary-long', 'PT12H')).allowed,
-    true,
-    'duration must not turn a factual ordinary upload into a livestream'
-  );
 }
 
-function testPremiereExperimentGoldenCorpusAdmissionFixture() {
+function testStrictCompletedBroadcastGoldenCorpusIsUniformlyRejected() {
   const ctx = makeContext();
   const corpus = [
     completedBroadcast(
@@ -1565,15 +1557,20 @@ function testPremiereExperimentGoldenCorpusAdmissionFixture() {
 
   const decisions = corpus.map(item => ctx.evaluateVideoAdmissionPolicy(item));
 
-  assert.deepStrictEqual(decisions.map(decision => decision.allowed), [true, false, false]);
+  assert.deepStrictEqual(decisions.map(decision => decision.allowed), [false, false, false]);
   assert.deepStrictEqual(decisions.map(decision => decision.blocking), [false, false, false]);
   assert.deepStrictEqual(
-    decisions.map(decision => decision.effectiveDurationSeconds),
-    [4140, 25908, 32552]
+    decisions.map(decision => decision.reason),
+    [
+      'completed_broadcast_rejected_by_strict_policy',
+      'completed_broadcast_rejected_by_strict_policy',
+      'completed_broadcast_rejected_by_strict_policy'
+    ]
   );
-  assert.strictEqual(decisions[0].admissionClass, 'HEURISTIC_PREMIERE_CANDIDATE');
-  assert.strictEqual(decisions[1].reason, 'completed_broadcast_over_90_minute_experiment_limit');
-  assert.strictEqual(decisions[2].reason, 'completed_broadcast_over_90_minute_experiment_limit');
+  decisions.forEach(decision => {
+    assert.strictEqual(decision.classification, 'COMPLETED_LIVE');
+    assert.strictEqual(decision.admissionClass, 'COMPLETED_LIVE');
+  });
 }
 
 function testStrictYoutubeTimestampGrammarAndExperimentParity() {
@@ -1632,12 +1629,13 @@ function testStrictYoutubeTimestampGrammarAndExperimentParity() {
     experimentOnly.experimentAdmissionDecision_(malformedTimeCandidate)
   ));
   assert.strictEqual(productionDecision.allowed, false);
-  assert.strictEqual(productionDecision.blocking, true);
-  assert.strictEqual(productionDecision.reason, 'completed_broadcast_actual_times_missing_or_invalid');
+  assert.strictEqual(productionDecision.blocking, false,
+    'known completed broadcasts are rejected independently of timestamp quality');
+  assert.strictEqual(productionDecision.reason, 'completed_broadcast_rejected_by_strict_policy');
   assert.deepStrictEqual(fallbackDecision, productionDecision);
 }
 
-function testPremiereExperimentFilterUsesSharedAdmissionDecision() {
+function testStrictFilterUsesSharedAdmissionDecision() {
   const ids = [
     'long-upload',
     'scheduled',
@@ -1699,17 +1697,18 @@ function testPremiereExperimentFilterUsesSharedAdmissionDecision() {
   ctx.currentRowStatus = ctx.createRowStatus();
   const result = Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3));
 
-  assert.deepStrictEqual(result, ['long-upload', 'short-archive']);
+  assert.deepStrictEqual(result, ['long-upload']);
   assert.strictEqual(listCalls, 1);
   assert.ok(requestedPart.includes('snippet'));
   assert.ok(requestedPart.includes('contentDetails'));
   assert.ok(requestedPart.includes('liveStreamingDetails'));
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, 3,
-    'scheduled, active, and incomplete completed-broadcast records all retain the checkpoint');
-  assert.ok(ctx.__logs.some(line => line.includes('HEURISTIC_PREMIERE_CANDIDATE') && line.includes('short-archive')));
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0,
+    'all known broadcast states are nonblocking strict rejections');
+  assert.ok(ctx.__logs.some(line =>
+    line.includes('completed_broadcast_rejected_by_strict_policy') && line.includes('short-archive')));
 }
 
-function testCompletedBroadcastMissingOrInvalidEvidenceIsFailClosed() {
+function testCompletedBroadcastEvidenceQualityDoesNotCreateAnAdmissionException() {
   const cases = [
     completedBroadcast('missing-duration', undefined, '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z'),
     completedBroadcast('zero-duration', 'PT0S', '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z'),
@@ -1724,8 +1723,9 @@ function testCompletedBroadcastMissingOrInvalidEvidenceIsFailClosed() {
     Array.from(ctx.applyFilters(cases.map(item => item.id), strictFilterSheet('Yes'), 3)),
     []
   );
-  assert.strictEqual(ctx.currentRowStatus.filterErrors, cases.length);
-  assert.strictEqual(ctx.currentRowStatus.errorCount, cases.length);
+  assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0,
+    'documented broadcast markers are sufficient for a permanent strict rejection');
 }
 
 function testConstructorVideoIdSurvivesDedupeAndStrictFilter() {
@@ -1822,15 +1822,15 @@ function testStrictShortFilterRemainsIndependent() {
 
   assert.deepStrictEqual(
     Array.from(ctx.applyFilters(ids, strictFilterSheet('No'), 3)),
-    ['ordinary-video', 'premiere-like-video']
+    ['ordinary-video']
   );
   assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
 
   ctx.currentRowStatus = ctx.createRowStatus();
   assert.deepStrictEqual(
     Array.from(ctx.applyFilters(ids, strictFilterSheet('Yes'), 3)),
-    ids,
-    'E=Yes must retain an otherwise eligible completed broadcast at or below three minutes'
+    ['ordinary-short', 'ordinary-video'],
+    'short filtering remains independent, but no completed broadcast is eligible'
   );
   assert.strictEqual(ctx.currentRowStatus.filterErrors, 0);
 }
@@ -1904,7 +1904,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   const ctx = makeExperimentContext();
   const result = {
     schemaVersion: 2,
-    policy: 'completed-broadcast-under-90m-heuristic-v1',
+    policy: 'strict-documented-broadcast-markers-v1',
     dryRun: true,
     rowNumber: 4,
     timestampReadFromColumnB: '2026-08-19T00:00:00.000Z',
@@ -1914,19 +1914,14 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
     sourceHashes: ['sha256:SOURCE-SECRET'],
     filterShorts: true,
     columnFIgnoredByStrictPolicy: true,
-    completedBroadcastMaxSeconds: 5400,
+    completedBroadcastMaxSeconds: null,
     acquiredCandidateIds: [
       'KEEP-ME-SECRET-1', 'KEEP-ME-SECRET-2',
       'completed-1', 'completed-2', 'active-1', 'upcoming-1',
       'unknown-1', 'unknown-2', 'metadata-missing-1'
     ],
     keptCandidateIds: ['KEEP-ME-SECRET-1', 'KEEP-ME-SECRET-2'],
-    admittedHeuristicCandidates: [{
-      videoId: 'HEURISTIC-SECRET-1',
-      classification: 'COMPLETED_LIVE',
-      admissionClass: 'HEURISTIC_PREMIERE_CANDIDATE',
-      effectiveDurationSeconds: 4140
-    }],
+    admittedHeuristicCandidates: [],
     rejectedCandidates: [
       {videoId: 'completed-1', reason: 'broadcast_marker', classification: 'COMPLETED_LIVE'},
       {videoId: 'completed-2', reason: 'broadcast_marker', classification: 'COMPLETED_LIVE'},
@@ -1970,7 +1965,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.strictEqual(summary.keptCandidateCount, 2);
   assert.strictEqual(summary.rejectedCandidateCount, 4);
   assert.strictEqual(summary.withheldCandidateCount, 3);
-  assert.strictEqual(summary.admittedHeuristicCandidateCount, 1);
+  assert.strictEqual(summary.admittedHeuristicCandidateCount, 0);
   assert.strictEqual(summary.schemaVersion, 2);
   assert.strictEqual(summary.policy, result.policy);
   assert.strictEqual(summary.dryRun, true);
@@ -1983,7 +1978,7 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.strictEqual(summary.sourceCount, 12);
   assert.strictEqual(summary.filterShorts, true);
   assert.strictEqual(summary.columnFIgnoredByStrictPolicy, true);
-  assert.strictEqual(summary.completedBroadcastMaxSeconds, 5400);
+  assert.strictEqual(summary.completedBroadcastMaxSeconds, null);
   assert.strictEqual(summary.targetReadComplete, true);
   assert.strictEqual(summary.blockingErrorCount, 3);
   assert.strictEqual(summary.warningCount, 1);
@@ -2000,7 +1995,6 @@ function testExperimentReplaySummaryAggregatesAndOmitsSensitiveLists() {
   assert.ok(!serialized.includes('ISSUE-SOURCE-SECRET'), 'nested issue samples must not leak per-source hashes');
   assert.ok(!serialized.includes('"sourceHash":'), 'issue samples must omit their sourceHash property');
   assert.ok(!serialized.includes('KEEP-ME-SECRET'), 'kept video IDs must not appear in summary JSON');
-  assert.ok(!serialized.includes('HEURISTIC-SECRET'), 'heuristic-admission video IDs must not appear in summary JSON');
 }
 
 function testExperimentReplaySummaryStaysBelowAppsScriptLogLimit() {
@@ -2505,13 +2499,13 @@ function testStrictTargetAuditPaginatesBatchesClassifiesAndNeverMutates() {
     UNKNOWN: 1
   });
   assert.strictEqual(report.admittedHeuristicCompletedBroadcastCount, 0);
-  assert.strictEqual(report.forbiddenCount, 1,
-    'only the definitively over-limit completed stream is permanently forbidden');
-  assert.strictEqual(report.withheldCount, 3,
-    'upcoming, active, and unknown items must remain retryable');
+  assert.strictEqual(report.forbiddenCount, 3,
+    'all documented broadcast states are permanent strict rejections');
+  assert.strictEqual(report.withheldCount, 1,
+    'only unknown metadata remains retryable');
   assert.strictEqual(report.unknownCount, 1);
   assert.strictEqual(report.mutationPerformed, false);
-  assert.strictEqual(ctx.currentRowStatus.policyErrors, 3);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
   assert.strictEqual(removeCalls, 0, 'v5 target audit must remain inspect-only');
 }
 
@@ -2628,7 +2622,7 @@ function testStrictTargetAuditMalformedPlaylistItemsAreWithheldAndBlocking() {
   assert.strictEqual(removeCalls, 0);
 }
 
-function testTargetAuditDoesNotCountHeuristicCandidateAsForbidden() {
+function testTargetAuditCountsEveryCompletedBroadcastAsForbidden() {
   const ctx = makeContext({
     PlaylistItems: {
       list() {
@@ -2656,13 +2650,13 @@ function testTargetAuditDoesNotCountHeuristicCandidateAsForbidden() {
 
   assert.strictEqual(report.classifications.NORMAL_UPLOAD, 1);
   assert.strictEqual(report.classifications.COMPLETED_LIVE, 1);
-  assert.strictEqual(report.admittedHeuristicCompletedBroadcastCount, 1);
-  assert.strictEqual(report.forbiddenCount, 0);
+  assert.strictEqual(report.admittedHeuristicCompletedBroadcastCount, 0);
+  assert.strictEqual(report.forbiddenCount, 1);
   assert.strictEqual(report.withheldCount, 0);
   assert.strictEqual(report.mutationPerformed, false);
 }
 
-function testPreInsertRevalidationRejectsStateTransition() {
+function testPreInsertRevalidationRejectsUpcomingWithoutBlocking() {
   let insertCalls = 0;
   const ctx = makeContext({
     Videos: {
@@ -2688,12 +2682,12 @@ function testPreInsertRevalidationRejectsStateTransition() {
 
   assert.strictEqual(insertCalls, 0, 'a candidate that becomes upcoming before insertion must never be written');
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
-  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1,
-    'a transitional pre-insert state must retain the checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 0,
+    'a known broadcast state is a permanent rejection, not a retryable failure');
   assert.ok(ctx.__logs.some(line => line.includes('pre-insert') && line.includes('UPCOMING')));
 }
 
-function testPreInsertRevalidationRejectsCompletedBroadcastOverLimit() {
+function testPreInsertRevalidationRejectsCompletedBroadcastAtAnyDuration() {
   let insertCalls = 0;
   const ctx = makeContext({
     Videos: {
@@ -2718,11 +2712,11 @@ function testPreInsertRevalidationRejectsCompletedBroadcastOverLimit() {
   assert.strictEqual(insertCalls, 0);
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
   assert.strictEqual(ctx.currentRowStatus.errorCount, 0,
-    'a proven over-limit completed stream is a known rejection, not a metadata failure');
-  assert.ok(ctx.__logs.some(line => line.includes('over_90_minute')));
+    'a completed broadcast is a known rejection, not a metadata failure');
+  assert.ok(ctx.__logs.some(line => line.includes('completed_broadcast_rejected_by_strict_policy')));
 }
 
-function testPreInsertIncompleteCompletedBroadcastEvidenceIsBlocking() {
+function testPreInsertCompletedBroadcastNeedsNoDurationOrTimestampEvidence() {
   let insertCalls = 0;
   const ctx = makeContext({
     Videos: {
@@ -2746,12 +2740,12 @@ function testPreInsertIncompleteCompletedBroadcastEvidenceIsBlocking() {
 
   assert.strictEqual(insertCalls, 0);
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
-  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
-  assert.strictEqual(ctx.currentRowStatus.errorCount, 1,
-    'incomplete pre-insert evidence must retain the checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 0);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0,
+    'the documented completed-broadcast marker is sufficient for rejection');
 }
 
-function testEligibleCompletedBroadcastSurvivesPreAndPostValidation() {
+function testCompletedBroadcastNeverReachesInsertion() {
   let metadataCalls = 0;
   const inserted = [];
   const removed = [];
@@ -2775,14 +2769,14 @@ function testEligibleCompletedBroadcastSurvivesPreAndPostValidation() {
 
   ctx.addVideosToPlaylist('PL_TARGET', ['known-premiere']);
 
-  assert.deepStrictEqual(inserted, ['known-premiere']);
+  assert.deepStrictEqual(inserted, []);
   assert.deepStrictEqual(removed, []);
-  assert.strictEqual(metadataCalls, 2);
-  assert.strictEqual(ctx.playlistWriteOperationsUsed, 1);
+  assert.strictEqual(metadataCalls, 1);
+  assert.strictEqual(ctx.playlistWriteOperationsUsed, 0);
   assert.strictEqual(ctx.currentRowStatus.errorCount, 0);
 }
 
-function testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks() {
+function testPostInsertCompletedBroadcastMarkerRollsBackWithoutBlocking() {
   let metadataCall = 0;
   const inserted = [];
   const removed = [];
@@ -2791,12 +2785,7 @@ function testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks() 
       list() {
         metadataCall += 1;
         if (metadataCall === 1) {
-          return {items: [completedBroadcast(
-            'postinsert-missing-end',
-            'PT30M',
-            '2026-08-20T10:00:00Z',
-            '2026-08-20T10:30:00Z'
-          )]};
+          return {items: [normalUpload('postinsert-missing-end', 'PT30M')]};
         }
         return {items: [completedBroadcast(
           'postinsert-missing-end',
@@ -2825,12 +2814,13 @@ function testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks() 
   assert.deepStrictEqual(removed, ['playlist-item-missing-end']);
   assert.strictEqual(metadataCall, 2);
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
-  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
-  assert.strictEqual(ctx.currentRowStatus.errorCount, 1,
-    'an incomplete post-insert state must roll back and retain the checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 0);
+  assert.strictEqual(ctx.currentRowStatus.errorCount, 0,
+    'a known completed-broadcast transition must roll back without freezing the checkpoint');
 }
 
-function testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack() {
+function testPostInsertTransitionFromUploadToCompletedBroadcastRollsBack() {
   let metadataCall = 0;
   const inserted = [];
   const removed = [];
@@ -2839,12 +2829,10 @@ function testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack() {
       list() {
         metadataCall += 1;
         if (metadataCall === 1) {
-          return {items: [completedBroadcast(
-            'grows-after-insert', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T11:00:00Z'
-          )]};
+          return {items: [normalUpload('grows-after-insert', 'PT1H')]};
         }
         return {items: [completedBroadcast(
-          'grows-after-insert', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T12:00:00Z'
+          'grows-after-insert', 'PT1H', '2026-08-20T10:00:00Z', '2026-08-20T11:00:00Z'
         )]};
       }
     },
@@ -2868,6 +2856,7 @@ function testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack() {
   assert.strictEqual(metadataCall, 2);
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
   assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 0);
 }
 
 function testPostInsertTransitionIsRolledBack() {
@@ -2908,9 +2897,9 @@ function testPostInsertTransitionIsRolledBack() {
   assert.deepStrictEqual(removed, ['playlist-item-1']);
   assert.strictEqual(metadataCall, 2, 'the inserted item must be checked both before and after insertion');
   assert.strictEqual(ctx.playlistWriteOperationsUsed, 2);
-  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 0);
-  assert.strictEqual(ctx.currentRowStatus.policyErrors, 1,
-    'a transitional post-insert state must roll back and retain the checkpoint');
+  assert.strictEqual(ctx.currentRowStatus.policyWarnings, 1);
+  assert.strictEqual(ctx.currentRowStatus.policyErrors, 0,
+    'a known active-broadcast transition is rolled back without freezing the checkpoint');
   assert.strictEqual(ctx.targetPlaylistVideoCache.PL_TARGET['changed-after-insert'], undefined);
 }
 
@@ -3834,7 +3823,7 @@ const tests = [
   testMissingSourceWarnsHealthyInsertAndAdvancesTimestamp,
   testMissingUploadsPlaylistWarnsHealthyInsertAndAdvancesTimestamp,
   testTransientSourceErrorStillBlocksCheckpoint,
-  testTransitionalBroadcastsRetainFullRowCheckpoint,
+  testMixedKnownBroadcastsRejectNormalUploadInsertsAndCheckpointAdvances,
   testInvalidCheckpointTimestampBlocksBeforeAnyApiOrWrite,
   testAggregateRowFailureDoesNotStopLaterRowCheckpoint,
   testDebugSetupFailuresDoNotBlockValidPlaylistRows,
@@ -3850,16 +3839,16 @@ const tests = [
   testExperimentAllSubscriptionFailuresAndMalformedItemsAreBlocking,
   testExperimentMissingTargetReadIsBlocking,
   testExperimentMalformedTargetItemBlocksReplayCheckpoint,
-  testExperimentReplayRetainsCheckpointForTransitionalBroadcasts,
+  testExperimentReplayRejectsKnownBroadcastsWithoutBlockingCheckpoint,
   testExperimentVideoMetadata404IsBlocking,
   testExperimentVideoMetadataBatchesOmitUnsupportedMaxResults,
   testCleanupFailureWarnsButDoesNotFreezeIngestionCheckpoint,
   testStrictClassificationOracle,
-  testPremiereExperimentDurationParserAndAdmissionBoundary,
-  testPremiereExperimentGoldenCorpusAdmissionFixture,
+  testStrictAdmissionRejectsEveryKnownBroadcastWithoutDurationException,
+  testStrictCompletedBroadcastGoldenCorpusIsUniformlyRejected,
   testStrictYoutubeTimestampGrammarAndExperimentParity,
-  testPremiereExperimentFilterUsesSharedAdmissionDecision,
-  testCompletedBroadcastMissingOrInvalidEvidenceIsFailClosed,
+  testStrictFilterUsesSharedAdmissionDecision,
+  testCompletedBroadcastEvidenceQualityDoesNotCreateAnAdmissionException,
   testConstructorVideoIdSurvivesDedupeAndStrictFilter,
   testUnknownMetadataIsFailClosedAndBlocksCheckpoint,
   testSuccessfulMetadataResponseOmissionIsWithheld,
@@ -3875,13 +3864,13 @@ const tests = [
   testStrictTargetAuditMetadataBatchFailureIsUnknownAndBlocking,
   testStrictTargetAuditMetadataOmissionIsWithheldAndBlocking,
   testStrictTargetAuditMalformedPlaylistItemsAreWithheldAndBlocking,
-  testTargetAuditDoesNotCountHeuristicCandidateAsForbidden,
-  testPreInsertRevalidationRejectsStateTransition,
-  testPreInsertRevalidationRejectsCompletedBroadcastOverLimit,
-  testPreInsertIncompleteCompletedBroadcastEvidenceIsBlocking,
-  testEligibleCompletedBroadcastSurvivesPreAndPostValidation,
-  testPostInsertIncompleteCompletedBroadcastMetadataRollsBackAndBlocks,
-  testPostInsertTransitionFromHeuristicCandidateToLongStreamRollsBack,
+  testTargetAuditCountsEveryCompletedBroadcastAsForbidden,
+  testPreInsertRevalidationRejectsUpcomingWithoutBlocking,
+  testPreInsertRevalidationRejectsCompletedBroadcastAtAnyDuration,
+  testPreInsertCompletedBroadcastNeedsNoDurationOrTimestampEvidence,
+  testCompletedBroadcastNeverReachesInsertion,
+  testPostInsertCompletedBroadcastMarkerRollsBackWithoutBlocking,
+  testPostInsertTransitionFromUploadToCompletedBroadcastRollsBack,
   testPostInsertTransitionIsRolledBack,
   testFirstTargetPageFailureBlocksWithoutProbesOrInserts,
   testPartialTargetReadUsesCandidateProbesAndContinues,
