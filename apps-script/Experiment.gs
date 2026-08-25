@@ -1,16 +1,15 @@
-// Read-only helpers for the completed-Premiere heuristic experiment.
+// Read-only helpers for strict broadcast-policy verification.
 //
 // These functions intentionally do not call processPlaylistRow(), applyFilters(),
 // addVideosToPlaylist(), deletePlaylistItems(), or any Range setter. They read the
-// configured row timestamp and source cells, query YouTube, and report what a
-// experimental admission policy would do without mutating the sheet or a playlist.
+// configured row timestamp and source cells, query YouTube, and report what the
+// strict admission policy would do without mutating the sheet or a playlist.
 
 var EXPERIMENT_FIRST_DATA_ROW_ = 4;
 var EXPERIMENT_FIRST_SOURCE_COLUMN_ = 7; // G (one-based)
 var EXPERIMENT_TIMESTAMP_COLUMN_ = 2;    // B (one-based)
 var EXPERIMENT_SHORTS_COLUMN_ = 5;       // E (one-based)
 var EXPERIMENT_VISIBLE_COLUMN_COUNT_ = 6; // A:F
-var EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_ = 90 * 60;
 
 /**
  * Return a SHA-256 fingerprint of G:lastColumn for rows 4:lastRow.
@@ -345,13 +344,11 @@ function experimentReadOnlyApiProbe_(callback) {
 }
 
 /**
- * Read-only replay of one configured playlist row under the Premiere experiment.
+ * Read-only replay of one configured playlist row under the strict policy.
  *
- * Upcoming and active broadcasts remain rejected and retry-blocking. A
- * completed broadcast-like item is admitted only as a heuristic Premiere
- * candidate when the larger of its playback duration and actual start-to-end
- * interval is <=90 minutes. Column F is intentionally ignored because the
- * experiment limit is hardcoded.
+ * Every known broadcast state is rejected without blocking the row checkpoint.
+ * Missing or unknown metadata remains retry-blocking and fail-closed. Column F
+ * is intentionally ignored because duration is not part of strict admission.
  */
 function replayStrictDryRun(rowNumber, optionalSheet) {
   rowNumber = Number(rowNumber);
@@ -401,7 +398,7 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
 
     var result = {
       schemaVersion: 2,
-      policy: "completed-broadcast-under-90m-heuristic-v1",
+      policy: "strict-documented-broadcast-markers-v1",
       dryRun: true,
       rowNumber: rowNumber,
       timestampReadFromColumnB: timestamp,
@@ -411,7 +408,9 @@ function replayStrictDryRun(rowNumber, optionalSheet) {
       sourceHashes: sources.map(function(source) { return source.hash; }),
       filterShorts: filterShorts,
       columnFIgnoredByStrictPolicy: true,
-      completedBroadcastMaxSeconds: EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_,
+      // Retained as a compatibility field for older report consumers. Strict
+      // admission has no duration exception.
+      completedBroadcastMaxSeconds: null,
       acquiredCandidateIds: candidateIds,
       keptCandidateIds: classification.kept,
       admittedHeuristicCandidates: classification.admittedHeuristicCandidates,
@@ -829,6 +828,8 @@ function experimentReadSourcePlaylistVideos_(playlistId, checkpointMillis, sourc
 }
 
 function experimentClassifyStrict_(videoIds, filterShorts, state) {
+  // admittedHeuristicCandidates is retained as an always-empty compatibility
+  // field for consumers of the former Premiere experiment report schema.
   var result = {kept: [], rejected: [], withheld: [], admittedHeuristicCandidates: []};
 
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -908,16 +909,6 @@ function experimentClassifyStrict_(videoIds, filterShorts, state) {
       }
 
       result.kept.push(videoId);
-      if (admission.classification === "COMPLETED_LIVE") {
-        result.admittedHeuristicCandidates.push({
-          videoId: videoId,
-          classification: admission.classification,
-          admissionClass: admission.admissionClass,
-          contentDurationSeconds: admission.contentDurationSeconds,
-          actualDurationSeconds: admission.actualDurationSeconds,
-          effectiveDurationSeconds: admission.effectiveDurationSeconds
-        });
-      }
     });
   }
 
@@ -946,57 +937,21 @@ function experimentAdmissionDecision_(item) {
     return decision;
   }
   if (classification === "UPCOMING") {
-    decision.blocking = true;
-    decision.reason = "upcoming_broadcast";
+    decision.reason = "upcoming_broadcast_rejected_by_strict_policy";
     return decision;
   }
   if (classification === "ACTIVE") {
-    decision.blocking = true;
-    decision.reason = "active_broadcast";
+    decision.reason = "active_broadcast_rejected_by_strict_policy";
     return decision;
   }
-  if (classification !== "COMPLETED_LIVE") {
+  if (classification === "COMPLETED_LIVE") {
+    decision.reason = "completed_broadcast_rejected_by_strict_policy";
+    return decision;
+  }
+  if (classification !== "NORMAL_UPLOAD") {
     decision.blocking = true;
     decision.reason = "live_state_missing_or_unknown";
     return decision;
-  }
-
-  var details = item && item.liveStreamingDetails;
-  var contentSeconds = experimentIsoDurationSeconds_(
-    item && item.contentDetails && item.contentDetails.duration
-  );
-  var startMillis = experimentTimestampMillis_(details && details.actualStartTime);
-  var endMillis = experimentTimestampMillis_(details && details.actualEndTime);
-  decision.contentDurationSeconds = contentSeconds;
-
-  if (contentSeconds === null || contentSeconds <= 0) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_duration_missing_or_invalid";
-    return decision;
-  }
-  if (startMillis === null || endMillis === null) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_actual_times_missing_or_invalid";
-    return decision;
-  }
-  if (endMillis <= startMillis) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_actual_time_order_invalid";
-    return decision;
-  }
-
-  decision.actualDurationSeconds = (endMillis - startMillis) / 1000;
-  decision.effectiveDurationSeconds = Math.max(
-    contentSeconds,
-    decision.actualDurationSeconds
-  );
-  decision.maxEffectiveDurationSeconds = EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_;
-  if (decision.effectiveDurationSeconds <= EXPERIMENT_COMPLETED_BROADCAST_MAX_SECONDS_) {
-    decision.allowed = true;
-    decision.admissionClass = "HEURISTIC_PREMIERE_CANDIDATE";
-    decision.reason = "completed_broadcast_within_90_minute_experiment_limit";
-  } else {
-    decision.reason = "completed_broadcast_over_90_minute_experiment_limit";
   }
   return decision;
 }

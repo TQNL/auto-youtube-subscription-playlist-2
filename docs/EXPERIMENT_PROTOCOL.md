@@ -1,10 +1,9 @@
-# Completed-Premiere heuristic experiment protocol
+# Strict broadcast-policy replay protocol
 
-This protocol turns spreadsheet replays into repeatable evidence for the
-`experiment/premiere-under-90m` branch. It is designed for the isolated
-`subscriptionPlaylists_test_env` sheet without storing its private target or
-source IDs in this repository. The promoted strict V5.3 protocol remains
-documented by the V5.3 archive and `STRICT_POLICY.md`.
+This protocol turns spreadsheet replays into repeatable evidence for the V5.5
+strict-broadcast candidate. It is designed for an isolated test sheet without
+storing private target or source IDs in this repository. The retired 90-minute
+experiment remains documented separately as historical evidence.
 
 ## Invariants
 
@@ -23,9 +22,9 @@ documented by the V5.3 archive and `STRICT_POLICY.md`.
 
 ## Isolated row under test
 
-- Row 4 is the only configured experiment row. Its two unchanged sources and
-  historical column-B checkpoint expose a compact corpus containing a known
-  completed Premiere, completed long streams, and an unrelated short.
+- Row 4 is the only configured experiment row. Its unchanged sources and
+  historical column-B checkpoint may expose a compact corpus containing ordinary
+  uploads, known completed broadcasts, transitional broadcasts, and shorts.
 - Row 5 is intentionally blank. It is not a fallback test row and must not be
   populated merely to run this experiment.
 
@@ -37,8 +36,9 @@ For every candidate revision:
 2. If a replay window must be reset before validation, set only B4 to the agreed
    historical ISO timestamp. Never change G4 or any later source cell.
 3. Run `replayRow4StrictDryRun()` from the experiment helper.
-4. Save the execution log and its structured
-   `PREMIERE_EXPERIMENT_REPLAY_RESULT` line.
+4. Save the execution log and its structured, compatibility-named
+   `PREMIERE_EXPERIMENT_REPLAY_RESULT` line. Require its `policy` field to equal
+   `strict-documented-broadcast-markers-v1`.
 5. Before a production validation, verify the source fingerprint again. After a
    successful production run, retain the production checkpoint rather than
    rewinding B4.
@@ -55,44 +55,33 @@ window.
 A normal upload is kept only when the API returns a valid item, the current
 broadcast state is exactly `none`, and `liveStreamingDetails` is absent.
 
-A completed broadcast-like item is admitted as a heuristic Premiere candidate
-only when all of these are true:
+Admission follows this matrix:
 
-- `snippet.liveBroadcastContent` is `none`;
-- `liveStreamingDetails.actualStartTime` and `actualEndTime` are strict, valid
-  ISO-8601 instants and the end is after the start;
-- `contentDetails.duration` is a valid positive ISO-8601 duration;
-- the greater of playback duration and actual elapsed broadcast time is at most
-  the hardcoded 5,400-second cutoff.
-
-A candidate is rejected or withheld when any of these is true:
-
-- `snippet.liveBroadcastContent` is `upcoming` or `live`: reject it now and retain
-  the checkpoint so a Premiere can be reconsidered after completion;
-- a completed broadcast exceeds 5,400 seconds: reject it;
-- required classification or duration/timestamp evidence is missing or invalid:
+- `NORMAL_UPLOAD`: keep it, regardless of duration;
+- `UPCOMING`, `ACTIVE`, or `COMPLETED_LIVE`: reject it without blocking the row
+  checkpoint;
+- `UNKNOWN`, omitted metadata, malformed responses, or failed metadata reads:
   withhold it and retain the checkpoint.
 
-Column E's existing shorts filter remains independent and runs after this
-admission decision. Column F remains reserved and ignored. The heuristic cannot
-prove that an admitted short completed broadcast was a Premiere; it deliberately
-accepts that residual false-positive risk to recover completed Premieres.
+The public API cannot reliably distinguish a completed Premiere from a completed
+livestream, so detectable Premieres are intentionally rejected. Duration and
+title never override a broadcast marker. Column E's existing shorts filter
+remains independent and runs only after strict admission. Column F remains
+reserved and ignored.
 
 ## Promotion gates
 
 - Syntax validation passes.
 - Regression tests pass.
 - One `videos.list` request classifies at most 50 candidate IDs.
-- Upcoming and active broadcasts are rejected and block checkpoint advancement.
-- The known completed Premiere is the only broadcast-like item planned for
-  insertion in the isolated replay.
-- Both known long completed streams are rejected by the greater-of-two-durations
-  rule.
+- Upcoming, active, and completed broadcast-like videos are all rejected without
+  blocking checkpoint advancement.
+- The known completed Premiere is rejected just like every completed broadcast.
 - A long ordinary upload is kept.
 - Missing/failed metadata is withheld and blocks the checkpoint.
 - One source failure does not erase valid candidates from healthy sources.
 - The source fingerprint is unchanged after browser testing.
-- After one controlled production run, the target contains the known Premiere
-  and does not contain either known long stream.
+- After one controlled production run, no known broadcast candidate is newly
+  inserted and ordinary eligible candidates behave normally.
 - The exact tested commit is pushed and tagged before the next iteration starts.
 

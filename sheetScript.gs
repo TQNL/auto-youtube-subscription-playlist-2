@@ -1,4 +1,4 @@
-// Completed-Premiere heuristic experiment v5.4-exp1: 2026-08-22
+// Strict broadcast rejection v5.5: 2026-08-25
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -17,15 +17,10 @@ var playlistWriteOperationsUsed = 0;
 var targetMembershipProbesUsed = 0;
 var targetMembershipQuotaFailure = null;
 
-// Experimental completed-broadcast exception. The public API has no reliable
-// completed-Premiere discriminator, so a completed broadcast-like item is only
-// admitted as a heuristic Premiere candidate when BOTH its playback duration
-// and actual start-to-end interval are proven at or below this hardcoded limit.
-// Taking the larger duration prevents a trimmed long livestream archive from
-// slipping through. Upcoming and active broadcasts remain unconditionally
-// rejected from insertion but retain the checkpoint for completion retry, and
-// column F remains reserved/ignored.
-var completedBroadcastExperimentMaxSeconds = 90 * 60;
+// Strict policy: every item carrying a documented YouTube broadcast marker is
+// rejected, including completed broadcasts and Premieres. Duration is never a
+// broadcast discriminator, so ordinary long uploads remain eligible. Column F
+// remains reserved/ignored.
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -1134,8 +1129,8 @@ function getTargetPendingVideoIds(playlistId, videoIds, inventory, maxMembership
 }
 
 // Non-mutating target audit. Factual broadcast classification stays separate
-// from the experimental admission decision so reports do not mislabel a
-// heuristic Premiere candidate as a proven Premiere.
+// from the admission decision so unknown metadata can remain fail-closed while
+// every known broadcast state is counted as forbidden.
 function inspectTargetPlaylistStrict(playlistId) {
   var playlistItems = [];
   var nextPageToken = null;
@@ -1187,7 +1182,6 @@ function inspectTargetPlaylistStrict(playlistId) {
     COMPLETED_LIVE: 0,
     UNKNOWN: unidentifiedPlaylistItemCount
   };
-  var admittedHeuristicCompletedBroadcastCount = 0;
   var forbiddenCount = 0;
   var withheldCount = unidentifiedPlaylistItemCount;
 
@@ -1216,20 +1210,16 @@ function inspectTargetPlaylistStrict(playlistId) {
         };
         var classification = decision.classification;
         counts[classification] += 1;
-        if (decision.allowed && classification == "COMPLETED_LIVE") {
-          admittedHeuristicCompletedBroadcastCount += 1;
-          safeLog("[PREMIERE EXPERIMENT TARGET AUDIT] HEURISTIC_PREMIERE_CANDIDATE: " +
-            formatVideoAdmissionEvidence(videoId, item, decision));
-        } else if (decision.blocking) {
+        if (decision.blocking) {
           withheldCount += 1;
           recordRowError(
             "policy",
-            "Premiere experiment target audit withheld " + classification + ": " +
+            "Strict target audit withheld " + classification + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision)
           );
         } else if (!decision.allowed) {
           forbiddenCount += 1;
-          safeLog("[PREMIERE EXPERIMENT TARGET AUDIT] REJECTED " + classification + ": " +
+          safeLog("[STRICT TARGET AUDIT] REJECTED " + classification + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision));
         }
       });
@@ -1245,7 +1235,9 @@ function inspectTargetPlaylistStrict(playlistId) {
     uniqueVideoCount: videoIds.length,
     unidentifiedPlaylistItemCount: unidentifiedPlaylistItemCount,
     classifications: counts,
-    admittedHeuristicCompletedBroadcastCount: admittedHeuristicCompletedBroadcastCount,
+    // Retained as a compatibility field for existing audit consumers. Strict
+    // policy never admits a completed broadcast, so this is always zero.
+    admittedHeuristicCompletedBroadcastCount: 0,
     forbiddenCount: forbiddenCount,
     withheldCount: withheldCount,
     unknownCount: counts.UNKNOWN,
@@ -1284,15 +1276,11 @@ function revalidateStrictCandidates(videoIds, context) {
         var decision = evaluateVideoAdmissionPolicy(item);
         if (decision.allowed) {
           allowedVideoIds.push(videoId);
-          if (decision.classification == "COMPLETED_LIVE") {
-            safeLog("Premiere experiment retained heuristic candidate during " + context + ": " +
-              formatVideoAdmissionEvidence(videoId, item, decision));
-          }
         } else if (decision.blocking) {
           recordRowError("policy", "Video " + videoId + " is not currently eligible while " + context +
             " and must be retried: " + formatVideoAdmissionEvidence(videoId, item, decision));
         } else {
-          safeLog("Premiere experiment rejected " + decision.classification + " during " + context + ": " +
+          safeLog("Strict policy rejected " + decision.classification + " during " + context + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision));
         }
       });
@@ -1698,7 +1686,7 @@ function applyFilters(videoIds, sheet, iRow) {
   var filterShorts = shortsSetting == "no";
 
   if (filterShorts) safeLog("Removing shorts");
-  safeLog("Premiere experiment: rejecting upcoming/active broadcasts and completed broadcasts over the hardcoded 90-minute effective-duration limit; column F is ignored");
+  safeLog("Strict livestream policy: rejecting upcoming, active, and completed broadcast-like videos; column F is ignored");
 
   var filteredVideoIds = [];
   for (var start = 0; start < videoIds.length; start += 50) {
@@ -1726,18 +1714,14 @@ function applyFilters(videoIds, sheet, iRow) {
 
         var decision = evaluateVideoAdmissionPolicy(item);
         if (decision.blocking) {
-          recordRowError("filter", "Cannot prove video is eligible under the Premiere experiment: " +
+          recordRowError("filter", "Cannot prove video is eligible under the strict broadcast policy: " +
             formatVideoAdmissionEvidence(videoId, item, decision));
           return;
         }
         if (!decision.allowed) {
-          safeLog("Premiere experiment rejected " + decision.classification + ": " +
+          safeLog("Strict policy rejected " + decision.classification + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision));
           return;
-        }
-        if (decision.classification == "COMPLETED_LIVE") {
-          safeLog("Premiere experiment admitted HEURISTIC_PREMIERE_CANDIDATE: " +
-            formatVideoAdmissionEvidence(videoId, item, decision));
         }
 
         var duration = item.contentDetails && item.contentDetails.duration;
@@ -1777,8 +1761,9 @@ function isLessThanThreeMinutes(duration) {
 }
 
 // Parse the documented ISO 8601 duration form used by videos.contentDetails.
-// Days are supported so very long videos fail the 90-minute experiment safely;
-// an empty P/PT, signs, calendar months/years, and malformed values are rejected.
+// This utility remains available for diagnostics/tests; broadcast admission no
+// longer depends on duration. Empty P/PT, signs, calendar months/years, and
+// malformed values are rejected.
 function parseIso8601DurationSeconds(duration) {
   var text = normalizeCellValue(duration);
   var match = text.match(
@@ -1850,12 +1835,11 @@ function parseApiTimestampMillis(value) {
   return isFinite(millis) ? millis : null;
 }
 
-// Keep factual classification separate from admission. The API cannot prove a
-// completed broadcast was a Premiere; this helper labels the <=90-minute result
-// as a heuristic candidate and requires complete, internally consistent timing
-// evidence. Transitional or unknown/incomplete evidence is blocking so a
-// possibly eligible Premiere is retried instead of being lost behind an
-// advanced checkpoint.
+// Keep factual classification separate from admission. The public API cannot
+// reliably distinguish a completed Premiere from a completed livestream, so
+// strict mode rejects every known broadcast state. Known rejections are
+// non-blocking because they can never become eligible under this policy;
+// missing or unknown metadata remains blocking and fail-closed.
 function evaluateVideoAdmissionPolicy(item) {
   var classification = classifyVideoStrict(item);
   var decision = {
@@ -1872,63 +1856,27 @@ function evaluateVideoAdmissionPolicy(item) {
     return decision;
   }
   if (classification == "UPCOMING") {
-    decision.blocking = true;
-    decision.reason = "upcoming_broadcast";
+    decision.reason = "upcoming_broadcast_rejected_by_strict_policy";
     return decision;
   }
   if (classification == "ACTIVE") {
-    decision.blocking = true;
-    decision.reason = "active_broadcast";
+    decision.reason = "active_broadcast_rejected_by_strict_policy";
     return decision;
   }
-  if (classification != "COMPLETED_LIVE") {
+  if (classification == "COMPLETED_LIVE") {
+    decision.reason = "completed_broadcast_rejected_by_strict_policy";
+    return decision;
+  }
+  if (classification != "NORMAL_UPLOAD") {
     decision.blocking = true;
     decision.reason = "live_state_missing_or_unknown";
     return decision;
-  }
-
-  var contentDuration = item && item.contentDetails && item.contentDetails.duration;
-  var contentDurationSeconds = parseIso8601DurationSeconds(contentDuration);
-  var details = item && item.liveStreamingDetails;
-  var actualStartMillis = parseApiTimestampMillis(details && details.actualStartTime);
-  var actualEndMillis = parseApiTimestampMillis(details && details.actualEndTime);
-  decision.contentDurationSeconds = contentDurationSeconds;
-
-  if (contentDurationSeconds === null || contentDurationSeconds <= 0) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_duration_missing_or_invalid";
-    return decision;
-  }
-  if (actualStartMillis === null || actualEndMillis === null) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_actual_times_missing_or_invalid";
-    return decision;
-  }
-  if (actualEndMillis <= actualStartMillis) {
-    decision.blocking = true;
-    decision.reason = "completed_broadcast_actual_time_order_invalid";
-    return decision;
-  }
-
-  var actualDurationSeconds = (actualEndMillis - actualStartMillis) / 1000;
-  var effectiveDurationSeconds = Math.max(contentDurationSeconds, actualDurationSeconds);
-  decision.actualDurationSeconds = actualDurationSeconds;
-  decision.effectiveDurationSeconds = effectiveDurationSeconds;
-  decision.maxEffectiveDurationSeconds = completedBroadcastExperimentMaxSeconds;
-
-  if (effectiveDurationSeconds <= completedBroadcastExperimentMaxSeconds) {
-    decision.allowed = true;
-    decision.admissionClass = "HEURISTIC_PREMIERE_CANDIDATE";
-    decision.reason = "completed_broadcast_within_90_minute_experiment_limit";
-  } else {
-    decision.reason = "completed_broadcast_over_90_minute_experiment_limit";
   }
   return decision;
 }
 
 // Classify only from documented API fields. Duration and title are deliberately
-// excluded from factual type classification; duration is considered only by the
-// separate experimental admission helper above.
+// excluded from factual type classification and admission.
 function classifyVideoStrict(item) {
   if (!item || !item.snippet) return "UNKNOWN";
 
