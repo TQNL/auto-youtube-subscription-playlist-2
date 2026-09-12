@@ -458,6 +458,7 @@ function testAggregateRowFailureDoesNotStopLaterRowCheckpoint() {
   const spreadsheet = {
     getSheets: () => [sheet],
     getSheetByName(name) {
+      if (name === 'VideoRetries') return {getDataRange: () => ({getValues: () => [ctx.videoRetryHeaders]})};
       if (name === 'DebugData') return debugSheet;
       if (name === 'Debug') return debugViewer;
       return null;
@@ -576,6 +577,7 @@ function testDebugSetupFailuresDoNotBlockValidPlaylistRows() {
     const spreadsheet = {
       getSheets: () => [sheet],
       getSheetByName(name) {
+        if (name === 'VideoRetries') return {getDataRange: () => ({getValues: () => [ctx.videoRetryHeaders]})};
         if (name === 'DebugData') return failingStage === 'creation' ? null : debugSheet;
         if (name === 'Debug') return debugViewer;
         return null;
@@ -1507,7 +1509,8 @@ function testStrictClassificationOracle() {
 function testStrictAdmissionRejectsEveryKnownBroadcastWithoutDurationException() {
   const ctx = makeContext();
   const cases = [
-    [normalUpload('ordinary-long', 'PT12H'), true, false, 'normal_upload'],
+    [normalUpload('ordinary-long', 'PT10H'), true, false, 'normal_upload'],
+    [normalUpload('over-hard-limit', 'PT12H'), false, false, 'over_10_hour_hard_limit'],
     [{id: 'scheduled', snippet: {liveBroadcastContent: 'upcoming'}}, false, false,
       'upcoming_broadcast_rejected_by_strict_policy'],
     [{id: 'active', snippet: {liveBroadcastContent: 'live'}}, false, false,
@@ -1653,7 +1656,7 @@ function testStrictFilterUsesSharedAdmissionDecision() {
         listCalls += 1;
         assert.deepStrictEqual(options.id.split(','), ids);
         return {items: [
-          normalUpload(ids[0], 'PT12H'),
+          normalUpload(ids[0], 'PT10H'),
           {
             id: ids[1],
             snippet: {liveBroadcastContent: 'upcoming'},
@@ -3421,6 +3424,7 @@ function testLoggerOutagePersistsInMemoryRowEvidenceAndKeepsAggregate() {
   const spreadsheet = {
     getSheets: () => [sheet],
     getSheetByName(name) {
+      if (name === 'VideoRetries') return {getDataRange: () => ({getValues: () => [ctx.videoRetryHeaders]})};
       if (name === 'DebugData') return debugSheet;
       if (name === 'Debug') return debugViewer;
       return null;

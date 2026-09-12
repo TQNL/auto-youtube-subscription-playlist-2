@@ -1,4 +1,4 @@
-// Strict broadcast rejection v5.5: 2026-08-25
+// Bounded hybrid destination deduplication v5.7: 2026-09-12
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -19,8 +19,15 @@ var targetMembershipQuotaFailure = null;
 
 // Strict policy: every item carrying a documented YouTube broadcast marker is
 // rejected, including completed broadcasts and Premieres. Duration is never a
-// broadcast discriminator, so ordinary long uploads remain eligible. Column F
+// broadcast discriminator. All uploads must also be at most 10 hours. Column F
 // remains reserved/ignored.
+var maximumVideoDurationSeconds = 10 * 60 * 60;
+var videoRetryAttemptLimit = 4; // Initial attempt plus three later executions.
+var videoRetryDelayHours = 100; // One final attempt after this waiting period.
+var videoRetryStore = null;
+var currentRetryPlaylistId = null;
+var currentRetryRowNumber = null;
+var videoRetryFailuresThisRun = Object.create(null);
 
 // Per-execution and per-row state. Source, filter, write, and maintenance
 // failures are tracked separately so one broken source cannot cancel videos
@@ -90,6 +97,10 @@ function updatePlaylists(sheet) {
     currentRowLogBuffer = [];
     currentRowLoggerStreamUnreliable = false;
     targetPlaylistVideoCache = Object.create(null);
+    videoRetryStore = null;
+    currentRetryPlaylistId = null;
+    currentRetryRowNumber = null;
+    videoRetryFailuresThisRun = Object.create(null);
     return updatePlaylistsLocked(sheet);
   } finally {
     lock.releaseLock();
@@ -112,6 +123,9 @@ function updatePlaylistsLocked(sheet) {
   }
 
   var data = sheet.getDataRange().getValues();
+  // This is correctness state, unlike DebugData: an unreadable queue must not
+  // silently forget withheld or permanently abandoned IDs.
+  videoRetryStore = openVideoRetryStore(spreadsheet, !experimentDryRun);
   var debugPersistenceWarnings = [];
   var bufferedRowDebugEvidence = [];
   var debugSheet = null;
@@ -163,6 +177,8 @@ function updatePlaylistsLocked(sheet) {
     clearLogBestEffort();
     safeLog("Row: " + (iRow + 1));
     currentRowStatus = createRowStatus();
+    currentRetryPlaylistId = playlistId;
+    currentRetryRowNumber = iRow + 1;
 
     try {
       processPlaylistRow(sheet, data, iRow, playlistId);
@@ -233,6 +249,8 @@ function updatePlaylistsLocked(sheet) {
         safeLog(debugWarning);
       } finally {
         currentRowStatus = null;
+        currentRetryPlaylistId = null;
+        currentRetryRowNumber = null;
       }
     }
   }
@@ -375,6 +393,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
 
   newVideoIds = dedupeVideoIds(newVideoIds);
   safeLog("Acquired " + newVideoIds.length + " unique videos");
+  newVideoIds = selectVideoRetryCandidates(playlistId, newVideoIds);
   newVideoIds = applyFilters(newVideoIds, sheet, iRow);
   safeLog("Filtering finished, left with " + newVideoIds.length + " videos");
 
@@ -403,6 +422,190 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
     currentRowStatus.timestampUpdated = true;
   } else if (debugFlag_dontUpdateTimestamp) {
     safeLog("Timestamp update disabled by debug flag");
+  }
+}
+
+// Persistent per-destination state, deliberately separate from the rotating log.
+// Do not delete ABANDONED/REJECTED rows: they are the durable exclusion list.
+var videoRetryHeaders = [
+  "Target playlist ID", "Video ID", "Status", "Failed attempts", "First failure",
+  "Last attempt", "Retry after", "Last reason", "Source row", "Title",
+  "Video URL", "Review notes (user)"
+];
+
+function videoRetryKey(playlistId, videoId) {
+  return JSON.stringify([playlistId, videoId]);
+}
+
+function openVideoRetryStore(spreadsheet, writable) {
+  var sheet = spreadsheet.getSheetByName("VideoRetries");
+  if (!sheet && writable) {
+    sheet = spreadsheet.insertSheet("VideoRetries");
+    sheet.getRange(1, 1, 1, videoRetryHeaders.length).setValues([videoRetryHeaders]);
+    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, videoRetryHeaders.length).setFontWeight("bold").setBackground("#d9ead3");
+    sheet.setColumnWidths(1, 2, 240);
+    sheet.setColumnWidth(3, 145);
+    sheet.setColumnWidth(4, 115);
+    sheet.setColumnWidths(5, 3, 165);
+    sheet.setColumnWidth(8, 420);
+    sheet.setColumnWidth(9, 95);
+    sheet.setColumnWidths(10, 3, 260);
+    SpreadsheetApp.flush();
+  }
+  var store = {sheet: sheet, entries: Object.create(null), nextRow: 2, writable: writable};
+  if (!sheet) return store; // A dry run never creates or changes queue state.
+  var values = sheet.getDataRange().getValues();
+  if (JSON.stringify(values[0].slice(0, videoRetryHeaders.length)) !== JSON.stringify(videoRetryHeaders)) {
+    throw new Error("VideoRetries has unexpected headers; restore them before running. No retry state was overwritten.");
+  }
+  store.nextRow = values.length + 1;
+  values.slice(1).forEach(function(row, index) {
+    if (!row.some(function(value) { return value !== ""; })) return;
+    var status = normalizeCellValue(row[2]);
+    var count = Number(row[3]);
+    var first = new Date(row[4]).getTime();
+    var last = new Date(row[5]).getTime();
+    var due = row[6] === "" ? null : new Date(row[6]).getTime();
+    var playlistId = normalizeCellValue(row[0]);
+    var videoId = normalizeCellValue(row[1]);
+    if (!playlistId || !videoId || ["RETRYING", "WAITING_100H", "ABANDONED", "RESOLVED", "REJECTED"].indexOf(status) < 0 ||
+        !isFinite(count) || count < 1 || Math.floor(count) !== count || !isFinite(first) || !isFinite(last) ||
+        (status === "WAITING_100H" && (due === null || !isFinite(due)))) {
+      throw new Error("Invalid VideoRetries record at row " + (index + 2) + "; review it before running.");
+    }
+    var key = videoRetryKey(playlistId, videoId);
+    if (store.entries[key]) throw new Error("Duplicate VideoRetries key at row " + (index + 2));
+    store.entries[key] = {playlistId: playlistId, videoId: videoId, status: status, failures: count,
+      first: first, last: last, due: due, reason: normalizeCellValue(row[7]),
+      sourceRow: row[8], title: normalizeCellValue(row[9]), sheetRow: index + 2};
+  });
+  return store;
+}
+
+function saveVideoRetryEntry(entry) {
+  if (!videoRetryStore || !videoRetryStore.writable || experimentDryRun) return;
+  var rowNumber = entry.sheetRow || videoRetryStore.nextRow;
+  var cellText = function(value) {
+    var text = String(value == null ? "" : value);
+    // Video titles/reasons are untrusted API data, never spreadsheet formulas.
+    return /^[=+@-]/.test(text) ? "'" + text : text;
+  };
+  var values = [entry.playlistId, entry.videoId, entry.status, entry.failures,
+    new Date(entry.first), new Date(entry.last), entry.due === null ? "" : new Date(entry.due),
+    entry.reason.slice(0, 4000), entry.sourceRow, entry.title.slice(0, 1000),
+    "https://www.youtube.com/watch?v=" + encodeURIComponent(entry.videoId)];
+  values = values.map(function(value) { return typeof value === "string" ? cellText(value) : value; });
+  // Never overwrite the user's notes column. Flush before returning so the row
+  // checkpoint can only be released AFTER its independent retry state is saved.
+  videoRetryStore.sheet.getRange(rowNumber, 1, 1, values.length).setValues([values]);
+  videoRetryStore.sheet.getRange(rowNumber, 5, 1, 3).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  SpreadsheetApp.flush();
+  entry.sheetRow = rowNumber;
+  videoRetryStore.nextRow = Math.max(videoRetryStore.nextRow, rowNumber + 1);
+  videoRetryStore.entries[videoRetryKey(entry.playlistId, entry.videoId)] = entry;
+}
+
+function selectVideoRetryCandidates(playlistId, discoveredIds) {
+  if (!videoRetryStore) return discoveredIds;
+  var now = Date.now();
+  var pending = Object.keys(videoRetryStore.entries).map(function(key) { return videoRetryStore.entries[key]; })
+    .filter(function(entry) {
+      return entry.playlistId === playlistId && (entry.status === "RETRYING" ||
+        (entry.status === "WAITING_100H" && entry.due <= now));
+    }).map(function(entry) { return entry.videoId; });
+  // Due records have priority within existing write/read budgets. They no longer
+  // depend on source pagination or the publication-time checkpoint.
+  var selected = dedupeVideoIds(pending.concat(discoveredIds)).filter(function(videoId) {
+    var key = videoRetryKey(playlistId, videoId);
+    var entry = videoRetryStore.entries[key];
+    if (entry && (entry.status === "ABANDONED" || entry.status === "REJECTED" ||
+        (entry.status === "WAITING_100H" && entry.due > now))) return false;
+    return true;
+  });
+  if (pending.length) safeLog("Retry queue supplied " + pending.length + " due/pending video(s) independently of the row timestamp.");
+  return selected;
+}
+
+// Only individual, successful-response metadata failures or videoNotFound on
+// insert enter this path. Whole-batch/auth/quota/target failures never spend an
+// individual video's retry allowance.
+function recordRetryableVideoFailure(videoId, kind, reason, item) {
+  if (!videoRetryStore || !currentRetryPlaylistId || !videoRetryStore.writable || experimentDryRun) {
+    recordRowError(kind, reason);
+    return;
+  }
+  var key = videoRetryKey(currentRetryPlaylistId, videoId);
+  var oldEntry = videoRetryStore.entries[key];
+  if (oldEntry && (oldEntry.status === "ABANDONED" || oldEntry.status === "REJECTED")) {
+    recordRowWarning(kind, "Video " + videoId + " remains " + oldEntry.status + "; review its VideoRetries record manually.");
+    return;
+  }
+  if (videoRetryFailuresThisRun[key]) {
+    // Multiple validation passes count at most once per execution.
+    if (!oldEntry || oldEntry.status === "RETRYING") recordRowError(kind, reason);
+    return;
+  }
+  var now = Date.now();
+  var entry = oldEntry && oldEntry.status !== "RESOLVED"
+    ? Object.assign({}, oldEntry)
+    : {playlistId: currentRetryPlaylistId, videoId: videoId, status: "RETRYING", failures: 0,
+      first: now, due: null, title: "", sheetRow: oldEntry ? oldEntry.sheetRow : null};
+  entry.last = now;
+  entry.sourceRow = currentRetryRowNumber;
+  entry.reason = reason;
+  if (item && item.snippet && item.snippet.title) entry.title = item.snippet.title;
+  entry.failures += 1;
+  if (entry.status === "WAITING_100H") {
+    if (entry.due > now) throw new Error("Refusing to spend a final retry before its due time: " + videoId);
+    entry.status = "ABANDONED";
+    entry.due = null;
+  } else if (entry.failures >= videoRetryAttemptLimit) {
+    entry.status = "WAITING_100H";
+    entry.due = now + videoRetryDelayHours * 3600000;
+  }
+  saveVideoRetryEntry(entry); // Throws on failure; callers retain the checkpoint.
+  videoRetryFailuresThisRun[key] = true;
+  if (entry.status === "RETRYING") {
+    recordRowError(kind, reason + " | attempt " + entry.failures + "/" + videoRetryAttemptLimit);
+  } else {
+    recordRowWarning(kind, "Video " + videoId + " saved as " + entry.status +
+      (entry.due !== null ? "; final retry no earlier than " + new Date(entry.due).toISOString() : "; manual review required in VideoRetries") +
+      ". This video no longer blocks the row timestamp. " + reason);
+  }
+}
+
+function finishVideoRetry(videoId, outcome, reason) {
+  if (!videoRetryStore || !currentRetryPlaylistId || !videoRetryStore.writable || experimentDryRun) return;
+  var oldEntry = videoRetryStore.entries[videoRetryKey(currentRetryPlaylistId, videoId)];
+  if (!oldEntry || ["RETRYING", "WAITING_100H"].indexOf(oldEntry.status) < 0) return;
+  var entry = Object.assign({}, oldEntry);
+  entry.status = outcome === "RESOLVED" ? "RESOLVED" :
+    (entry.status === "WAITING_100H" ? "ABANDONED" : "REJECTED");
+  entry.last = Date.now();
+  entry.due = null;
+  entry.reason = reason;
+  saveVideoRetryEntry(entry);
+  safeLog("Retry record " + videoId + " -> " + entry.status + ": " + reason);
+}
+
+// Safe one-time setup/verification entry point: no YouTube calls, source reads,
+// playlist changes, timestamp edits or trigger changes. Also runs lazily from
+// updatePlaylists so an operator does not have to initialize it manually.
+function initializeVideoRetries() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error("An update is running; initialize after it finishes.");
+  try {
+    var sheetID = PropertiesService.getScriptProperties().getProperty("sheetID");
+    if (!sheetID) throw new Error("Open the bound spreadsheet first to initialize sheetID.");
+    var store = openVideoRetryStore(SpreadsheetApp.openById(sheetID), true);
+    var result = {version: "5.7", sheetId: sheetID, retryRecords: Object.keys(store.entries).length,
+      attemptsBeforeWaiting: videoRetryAttemptLimit, waitHours: videoRetryDelayHours,
+      maxDurationSeconds: maximumVideoDurationSeconds, youtubeCalls: 0, checkpointsChanged: false};
+    safeLog("RETRY_SETUP_RESULT " + JSON.stringify(result));
+    return result;
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -936,6 +1139,15 @@ function getTargetPlaylistVideoInventory(playlistId) {
     complete: false,
     pagesRead: 0
   };
+  // A target inventory is an optimization, not a prerequisite for proving
+  // absence. Never crawl a large destination on the insertion path. Two pages
+  // amortize duplicate checks for retries; exact videoId probes resolve misses.
+  // This hard cap is intentionally independent of playlist/candidate size.
+  var maxTargetPages = 2;
+  if (targetMembershipQuotaFailure) {
+    targetPlaylistVideoCache[playlistId] = inventory;
+    return inventory;
+  }
   var nextPageToken = null;
   var seenPageTokens = Object.create(null);
 
@@ -997,6 +1209,12 @@ function getTargetPlaylistVideoInventory(playlistId) {
       }
       if (returnedToken) seenPageTokens[returnedToken] = true;
       nextPageToken = returnedToken;
+      if (nextPageToken && inventory.pagesRead >= maxTargetPages) {
+        safeLog("Target deduplication: stopped at the " + maxTargetPages +
+          "-page scan cap; exact membership checks will resolve unseen candidates.");
+        targetPlaylistVideoCache[playlistId] = inventory;
+        return inventory; // Still incomplete: a scan miss NEVER proves absence.
+      }
     } catch (e) {
       if (isQuotaExhaustionError(e)) targetMembershipQuotaFailure = e;
       if (inventory.pagesRead === 0) {
@@ -1269,7 +1487,7 @@ function revalidateStrictCandidates(videoIds, context) {
       batch.forEach(function(videoId) {
         var item = itemsById[videoId];
         if (!item) {
-          recordRowError("policy", "Video " + videoId + " was omitted while " + context + "; withholding it for retry");
+          recordRetryableVideoFailure(videoId, "policy", "Video " + videoId + " was omitted while " + context + "; withholding it for retry");
           return;
         }
 
@@ -1277,11 +1495,12 @@ function revalidateStrictCandidates(videoIds, context) {
         if (decision.allowed) {
           allowedVideoIds.push(videoId);
         } else if (decision.blocking) {
-          recordRowError("policy", "Video " + videoId + " is not currently eligible while " + context +
-            " and must be retried: " + formatVideoAdmissionEvidence(videoId, item, decision));
+          recordRetryableVideoFailure(videoId, "policy", "Video " + videoId + " is not currently eligible while " + context +
+            " and must be retried: " + formatVideoAdmissionEvidence(videoId, item, decision), item);
         } else {
           safeLog("Strict policy rejected " + decision.classification + " during " + context + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision));
+          finishVideoRetry(videoId, "REJECTED", decision.reason);
         }
       });
     } catch (e) {
@@ -1442,18 +1661,22 @@ function postValidateInsertedItems(records, existingVideos) {
         classification: "UNKNOWN",
         reason: "video_metadata_missing"
       };
-      if (decision.allowed) return;
+      if (decision.allowed) {
+        finishVideoRetry(record.videoId, "RESOLVED", "Inserted and post-insert policy verified");
+        return;
+      }
 
       var reason = item
         ? "post-insert admission changed to " + decision.reason + " (" + decision.classification + ")"
         : "video was omitted by post-insert metadata";
-      if (decision.blocking) {
-        recordRowError("policy", "Post-insert state for video " + record.videoId +
-          " requires retry: " + reason + "; rolling it back");
-      } else {
+      var rolledBack = rollbackInsertedPlaylistItem(record, existingVideos, reason);
+      if (decision.blocking && rolledBack) {
+        recordRetryableVideoFailure(record.videoId, "policy", "Post-insert state for video " + record.videoId +
+          " requires retry: " + reason + "; rolled back", item);
+      } else if (!decision.blocking) {
         recordRowWarning("policy", "Post-insert state for video " + record.videoId + " is no longer eligible: " + reason + "; rolling it back");
+        if (rolledBack) finishVideoRetry(record.videoId, "REJECTED", reason);
       }
-      rollbackInsertedPlaylistItem(record, existingVideos, reason);
     });
   }
 }
@@ -1489,9 +1712,18 @@ function addVideosToPlaylist(playlistId, videoIds) {
     targetInventory,
     Math.min(safeInsertCapacity, remainingMembershipProbeBudget)
   );
+  safeLog("Target deduplication: inventory pages=" + targetInventory.pagesRead +
+    ", complete=" + targetInventory.complete +
+    ", exact checks=" + membershipResult.membershipProbesUsed +
+    ", present=" + membershipResult.alreadyPresentCount +
+    ", absent=" + membershipResult.pendingVideoIds.length +
+    ", unresolved=" + membershipResult.unresolvedCount + ".");
   var existingVideos = targetInventory.videoSet;
   var pendingVideoIds = membershipResult.pendingVideoIds;
   var alreadyPresentCount = membershipResult.alreadyPresentCount;
+  videoIds.forEach(function(videoId) {
+    if (existingVideos[videoId]) finishVideoRetry(videoId, "RESOLVED", "Already present in target playlist");
+  });
   if (alreadyPresentCount > 0) {
     safeLog("Skipped " + alreadyPresentCount + " video(s) already present in the target playlist.");
   }
@@ -1570,10 +1802,11 @@ function addVideosToPlaylist(playlistId, videoIds) {
         existingVideos[videoId] = true;
         skippedCount += 1;
         safeLog("Skipped video already present in playlist: " + videoId);
+        finishVideoRetry(videoId, "RESOLVED", "Insert API confirmed already present");
       } else if (reason === "videoNotFound") {
         errorCount += 1;
-        recordRowError(
-          "write",
+        recordRetryableVideoFailure(
+          videoId, "write",
           "Video " + videoId + " disappeared between validation and insertion; withholding it for retry: " + describeError(e)
         );
       } else if (reason === "playlistOperationUnsupported") {
@@ -1708,28 +1941,30 @@ function applyFilters(videoIds, sheet, iRow) {
       batch.forEach(function(videoId) {
         var item = itemsById[videoId];
         if (!item) {
-          recordRowError("filter", "Video " + videoId + " was omitted from a successful metadata response; withholding it for retry");
+          recordRetryableVideoFailure(videoId, "filter", "Video " + videoId + " was omitted from a successful metadata response; withholding it for retry");
           return;
         }
 
         var decision = evaluateVideoAdmissionPolicy(item);
         if (decision.blocking) {
-          recordRowError("filter", "Cannot prove video is eligible under the strict broadcast policy: " +
-            formatVideoAdmissionEvidence(videoId, item, decision));
+          recordRetryableVideoFailure(videoId, "filter", "Cannot prove video is eligible under the admission policy: " +
+            formatVideoAdmissionEvidence(videoId, item, decision), item);
           return;
         }
         if (!decision.allowed) {
           safeLog("Strict policy rejected " + decision.classification + ": " +
             formatVideoAdmissionEvidence(videoId, item, decision));
+          finishVideoRetry(videoId, "REJECTED", decision.reason);
           return;
         }
 
         var duration = item.contentDetails && item.contentDetails.duration;
         if (filterShorts && !duration) {
-          recordRowError("filter", "Video " + videoId + " has no duration metadata; withholding it for retry");
+          recordRetryableVideoFailure(videoId, "filter", "Video " + videoId + " has no duration metadata; withholding it for retry", item);
           return;
         } else if (filterShorts && isLessThanThreeMinutes(duration)) {
           safeLog("Filtered short: " + videoId + " | duration: " + duration);
+          finishVideoRetry(videoId, "REJECTED", "Excluded by this row's Shorts filter");
           return;
         }
         filteredVideoIds.push(videoId);
@@ -1851,6 +2086,17 @@ function evaluateVideoAdmissionPolicy(item) {
   };
 
   if (classification == "NORMAL_UPLOAD") {
+    var duration = parseIso8601DurationSeconds(item.contentDetails && item.contentDetails.duration);
+    decision.contentDurationSeconds = duration;
+    if (duration === null || duration <= 0) {
+      decision.blocking = true;
+      decision.reason = "duration_missing_invalid_or_zero";
+      return decision;
+    }
+    if (duration > maximumVideoDurationSeconds) {
+      decision.reason = "over_10_hour_hard_limit";
+      return decision;
+    }
     decision.allowed = true;
     decision.reason = "normal_upload";
     return decision;
@@ -1876,7 +2122,8 @@ function evaluateVideoAdmissionPolicy(item) {
 }
 
 // Classify only from documented API fields. Duration and title are deliberately
-// excluded from factual type classification and admission.
+// excluded from factual type classification. A separate duration admission cap
+// applies to normal uploads without changing their factual classification.
 function classifyVideoStrict(item) {
   if (!item || !item.snippet) return "UNKNOWN";
 

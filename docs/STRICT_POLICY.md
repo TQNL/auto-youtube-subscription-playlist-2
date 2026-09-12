@@ -14,6 +14,12 @@ This fork chooses the testable invariant: no item carrying a documented broadcas
 marker may be inserted. Candidate metadata failures are fail-closed and retried.
 Historical target entries are audited separately before any repair action.
 
+V5.6 additionally rejects ordinary uploads longer than ten hours. This is a hard
+safety limit, not a livestream classifier. Unresolved candidate-specific failures
+now use a bounded persistent queue: four failures, a 100-hour wait, then one final
+attempt and permanent manual-review storage if it still fails. Infrastructure
+failures do not consume that allowance. See [bounded retries](RETRY_QUEUE.md).
+
 Official references:
 
 - https://developers.google.com/youtube/v3/docs/videos

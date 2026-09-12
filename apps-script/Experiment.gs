@@ -932,6 +932,17 @@ function experimentAdmissionDecision_(item) {
     reason: ""
   };
   if (classification === "NORMAL_UPLOAD") {
+    var duration = experimentIsoDurationSeconds_(item.contentDetails && item.contentDetails.duration);
+    decision.contentDurationSeconds = duration;
+    if (duration === null || duration <= 0) {
+      decision.blocking = true;
+      decision.reason = "duration_missing_invalid_or_zero";
+      return decision;
+    }
+    if (duration > 36000) {
+      decision.reason = "over_10_hour_hard_limit";
+      return decision;
+    }
     decision.allowed = true;
     decision.reason = "normal_upload";
     return decision;
