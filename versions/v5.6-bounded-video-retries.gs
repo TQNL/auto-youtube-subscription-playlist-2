@@ -1,4 +1,4 @@
-// Bounded hybrid destination deduplication v5.7: 2026-09-12
+// Bounded video retries + 10-hour maximum v5.6: 2026-09-07
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -599,7 +599,7 @@ function initializeVideoRetries() {
     var sheetID = PropertiesService.getScriptProperties().getProperty("sheetID");
     if (!sheetID) throw new Error("Open the bound spreadsheet first to initialize sheetID.");
     var store = openVideoRetryStore(SpreadsheetApp.openById(sheetID), true);
-    var result = {version: "5.7", sheetId: sheetID, retryRecords: Object.keys(store.entries).length,
+    var result = {version: "5.6", sheetId: sheetID, retryRecords: Object.keys(store.entries).length,
       attemptsBeforeWaiting: videoRetryAttemptLimit, waitHours: videoRetryDelayHours,
       maxDurationSeconds: maximumVideoDurationSeconds, youtubeCalls: 0, checkpointsChanged: false};
     safeLog("RETRY_SETUP_RESULT " + JSON.stringify(result));
@@ -1139,15 +1139,6 @@ function getTargetPlaylistVideoInventory(playlistId) {
     complete: false,
     pagesRead: 0
   };
-  // A target inventory is an optimization, not a prerequisite for proving
-  // absence. Never crawl a large destination on the insertion path. Two pages
-  // amortize duplicate checks for retries; exact videoId probes resolve misses.
-  // This hard cap is intentionally independent of playlist/candidate size.
-  var maxTargetPages = 2;
-  if (targetMembershipQuotaFailure) {
-    targetPlaylistVideoCache[playlistId] = inventory;
-    return inventory;
-  }
   var nextPageToken = null;
   var seenPageTokens = Object.create(null);
 
@@ -1209,12 +1200,6 @@ function getTargetPlaylistVideoInventory(playlistId) {
       }
       if (returnedToken) seenPageTokens[returnedToken] = true;
       nextPageToken = returnedToken;
-      if (nextPageToken && inventory.pagesRead >= maxTargetPages) {
-        safeLog("Target deduplication: stopped at the " + maxTargetPages +
-          "-page scan cap; exact membership checks will resolve unseen candidates.");
-        targetPlaylistVideoCache[playlistId] = inventory;
-        return inventory; // Still incomplete: a scan miss NEVER proves absence.
-      }
     } catch (e) {
       if (isQuotaExhaustionError(e)) targetMembershipQuotaFailure = e;
       if (inventory.pagesRead === 0) {
@@ -1712,12 +1697,6 @@ function addVideosToPlaylist(playlistId, videoIds) {
     targetInventory,
     Math.min(safeInsertCapacity, remainingMembershipProbeBudget)
   );
-  safeLog("Target deduplication: inventory pages=" + targetInventory.pagesRead +
-    ", complete=" + targetInventory.complete +
-    ", exact checks=" + membershipResult.membershipProbesUsed +
-    ", present=" + membershipResult.alreadyPresentCount +
-    ", absent=" + membershipResult.pendingVideoIds.length +
-    ", unresolved=" + membershipResult.unresolvedCount + ".");
   var existingVideos = targetInventory.videoSet;
   var pendingVideoIds = membershipResult.pendingVideoIds;
   var alreadyPresentCount = membershipResult.alreadyPresentCount;

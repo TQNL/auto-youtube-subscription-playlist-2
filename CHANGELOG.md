@@ -3,6 +3,32 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
+## V5.7 bounded hybrid destination deduplication
+
+- Destination inventory reads stop after two pages (100 entries). A capped
+  inventory remains incomplete; unseen candidates receive exact membership
+  checks using the documented playlistId + videoId filter before insertion.
+- Reuses positive membership and inventory results within an execution; keeps
+  existing exact-probe and rollback-safe write budgets, and fails closed on
+  uncertain membership. Known quota exhaustion suppresses further head scans.
+- Logs page/probe counts and resolution totals. Source acquisition, retry
+  ledgers, strict broadcast rejection, timestamps and cleanup are unchanged.
+- Adds seven deterministic cost/safety tests; see docs/HYBRID_DEDUP.md.
+
+## V5.6 bounded video retries
+
+- Adds a persistent, visible `VideoRetries` ledger for each spreadsheet. Four
+  candidate-specific failures defer the ID for 100 hours without holding the row
+  checkpoint; a final failure permanently abandons it for manual review.
+- Reintroduces due IDs independently of the source publication window. Preserves
+  user review notes, destination-specific state, and fail-closed storage handling.
+- Excludes quota/authentication, whole-request, destination, and failed-rollback
+  problems from the per-video failure allowance.
+- Rejects ordinary videos over ten hours at initial, pre-insert, and post-insert
+  checks. Strict broadcast rejection and the unrelated filters remain in force.
+- Adds setup-only `initializeVideoRetries()` and deterministic retry lifecycle
+  tests. See `docs/RETRY_QUEUE.md` for exact timing and manual review behavior.
+
 ## V5.5 strict broadcast rejection (candidate)
 
 - Retires the 90-minute completed-broadcast exception. Duration no longer
