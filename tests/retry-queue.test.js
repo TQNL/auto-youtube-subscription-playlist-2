@@ -61,10 +61,12 @@ function fixture(existingRows) {
     setValue(value) { assert.strictEqual(c, 2); row[1] = value; state.checkpoints.push(value); }
   }; }};
   ctx.getPlaylistVideoIds = () => state.discovered || ['missing', 'healthy'];
-  ctx.getTargetPlaylistVideoInventory = () => ({videoSet: {}, complete: true});
-  ctx.getTargetPendingVideoIds = (playlist, ids, inventory) => {
-    (state.alreadyPresent || []).forEach(id => { inventory.videoSet[id] = true; });
-    return {pendingVideoIds: ids.filter(id => !inventory.videoSet[id]), alreadyPresentCount: ids.filter(id => inventory.videoSet[id]).length};
+  // V5.8 resolves membership one candidate at a time against a possibly partial
+  // inventory. A complete fixture inventory proves presence without any read.
+  ctx.getTargetPlaylistVideoInventory = () => {
+    const videoSet = Object.create(null);
+    (state.alreadyPresent || []).forEach(id => { videoSet[id] = true; });
+    return {videoSet, complete: true, pagesRead: 1};
   };
   state.reset = function(playlist = 'PL_DESTINATION') {
     ctx.videoRetryStore = ctx.openVideoRetryStore(spreadsheet, true); // Reload persisted state each run.

@@ -3094,11 +3094,17 @@ function testPartialTargetReadUsesCandidateProbesAndContinues() {
   assert.strictEqual(run.ctx.currentRowStatus.timestampUpdated, true);
   assert.strictEqual(run.timestampWrites, 1, 'safe partial-read run should advance its checkpoint');
   assert.strictEqual(run.ctx.playlistWriteOperationsUsed, 1);
-  assert.ok(run.ctx.__logs.some(line => line.includes('Skipped 2 video(s) already present')));
-  assert.ok(run.ctx.__logs.some(line => line.includes('Added 1 video(s); skipped 0; failed 0.')));
+  const summary = run.ctx.__logs.find(line => line.includes('Sequential target progress:'));
+  assert.ok(summary, 'sequential candidate processing must emit one explicit progress summary');
+  assert.ok(summary.includes('present=2'),
+    'a first-page match and an exact-probe match must both count as already present');
+  assert.ok(summary.includes('insert attempts=1') && summary.includes('added=1'));
+  assert.ok(summary.includes('failed=0') && summary.includes('stoppedEarly=false'));
+  assert.ok(!run.ctx.__logs.some(line => line.includes('probe limit of')),
+    'the retired membership-probe ceiling must never appear during ordinary sequential processing');
 }
 
-function testOneMembershipProbeFailureWithholdsOnlyThatCandidate() {
+function testUnverifiableMembershipStopsSequentialProgressAndRetainsCheckpoint() {
   const unverifiable = 'candidate-with-failed-membership-probe';
   const knownAbsent = 'candidate-proven-absent';
   const run = runPartialTargetReadInsertScenario(
@@ -3109,11 +3115,12 @@ function testOneMembershipProbeFailureWithholdsOnlyThatCandidate() {
   );
 
   assert.deepStrictEqual(run.targetListPageTokens, [undefined, 'unreadable-target-page-2']);
-  assert.deepStrictEqual(run.candidateProbeIds, [unverifiable, knownAbsent]);
-  assert.deepStrictEqual(run.inserted, [knownAbsent],
-    'one failed membership probe must not cancel another candidate proven absent');
+  assert.deepStrictEqual(run.candidateProbeIds, [unverifiable],
+    'the sequential walk stops at the first candidate whose membership cannot be decided');
+  assert.deepStrictEqual(run.inserted, [],
+    'no later candidate may be mutated once one candidate is left unresolved');
   assert.deepStrictEqual(run.removed, []);
-  assert.strictEqual(run.ctx.playlistWriteOperationsUsed, 1);
+  assert.strictEqual(run.ctx.playlistWriteOperationsUsed, 0);
   assert.strictEqual(run.ctx.currentRowStatus.writeWarnings, 1,
     'later target-page failure remains a non-blocking optimization warning');
   assert.strictEqual(run.ctx.currentRowStatus.writeErrors, 1,
@@ -3121,7 +3128,9 @@ function testOneMembershipProbeFailureWithholdsOnlyThatCandidate() {
   assert.strictEqual(run.ctx.currentRowStatus.errorCount, 1);
   assert.strictEqual(run.ctx.currentRowStatus.timestampUpdated, false);
   assert.strictEqual(run.timestampWrites, 0);
-  assert.ok(run.ctx.__logs.some(line => line.includes('Added 1 video(s)')));
+  const summary = run.ctx.__logs.find(line => line.includes('Sequential target progress:'));
+  assert.ok(summary && summary.includes('checked=1') && summary.includes('stoppedEarly=true'),
+    'the summary must disclose exactly how far the sequential walk got');
 }
 
 function testMalformedTargetInventoryItemForcesExactMembershipProbe() {
@@ -3188,7 +3197,9 @@ function testExactLegacyDuplicateReasonMaySafeSkip() {
   assert.strictEqual(run.timestampWrites, 1);
   assert.strictEqual(run.ctx.playlistWriteOperationsUsed, 1);
   assert.ok(run.ctx.__logs.some(line => line.includes('Skipped video already present in playlist: ' + candidate)));
-  assert.ok(run.ctx.__logs.some(line => line.includes('Added 0 video(s); skipped 1; failed 0.')));
+  const summary = run.ctx.__logs.find(line => line.includes('Sequential target progress:'));
+  assert.ok(summary && summary.includes('added=0') && summary.includes('insert-race skips=1'),
+    'an insert-race duplicate resolves the candidate without being reported as an added video');
 }
 
 function testInsertTimeVideoNotFoundBlocksCheckpoint() {
@@ -3240,7 +3251,8 @@ function testGeneric409AfterPartialTargetProbeBlocksCheckpoint() {
   assert.strictEqual(run.timestampWrites, 0);
   assert.deepStrictEqual(run.reconciliationProbeIds, [],
     'a definite 4xx rejection must not be mistaken for an uncertain committed mutation');
-  assert.ok(run.ctx.__logs.some(line => line.includes('failed 1')));
+  assert.ok(run.ctx.__logs.some(line => line.includes('failed=1')),
+    'a generic 409 must be reported as a failure, not an idempotent skip, in the progress summary');
 }
 
 function testConstructorVideoIdIsNotMistakenForTargetMembership() {
@@ -3353,7 +3365,10 @@ function testLoggerFailureDuringLaterDuplicateStillPostValidatesEarlierInsert() 
     Videos: {
       list(part, options) {
         metadataCalls += 1;
-        if (metadataCalls === 1) {
+        // V5.8 revalidates each candidate immediately before its own insertion, so
+        // the first two calls are the per-candidate pre-insert revalidations and
+        // only the third call is the post-insert validation of the earlier success.
+        if (metadataCalls <= 2) {
           return {items: options.id.split(',').map(id => normalUpload(id, 'PT20M'))};
         }
         throw new Error('post-insert metadata unavailable after duplicate');
@@ -3382,8 +3397,8 @@ function testLoggerFailureDuringLaterDuplicateStillPostValidatesEarlierInsert() 
   ctx.addVideosToPlaylist('PL_TARGET', ['earlier-success', 'later-duplicate']);
 
   assert.deepStrictEqual(insertAttempts, ['earlier-success', 'later-duplicate']);
-  assert.strictEqual(metadataCalls, 2,
-    'the duplicate-branch log failure must not skip post-validation of an earlier success');
+  assert.strictEqual(metadataCalls, 3,
+    'two per-candidate pre-insert revalidations plus one post-insert check must all run despite the duplicate-branch log failure');
   assert.deepStrictEqual(removed, ['playlist-item-earlier-success']);
   assert.strictEqual(ctx.currentRowStatus.policyErrors, 1);
   assert.strictEqual(ctx.currentRowStatus.errorCount, 1);
@@ -3466,7 +3481,7 @@ function testLoggerOutagePersistsInMemoryRowEvidenceAndKeepsAggregate() {
   assert.strictEqual(lockReleased, true);
 }
 
-function testPartialTargetProbeFanoutIsBoundedAndRetainsCheckpoint() {
+function testInsertCapacityBoundsWritesWhileMembershipReadsKeepGoing() {
   const candidates = Array.from({length: 10}, (_, index) => 'bounded-candidate-' + index);
   const run = runPartialTargetReadInsertScenario(
     candidates,
@@ -3475,17 +3490,20 @@ function testPartialTargetProbeFanoutIsBoundedAndRetainsCheckpoint() {
     {maxWriteOperations: 6}
   );
 
-  assert.deepStrictEqual(run.candidateProbeIds, candidates.slice(0, 3),
-    'three rollback-safe insert slots must permit at most three exact membership probes');
   assert.deepStrictEqual(run.inserted, candidates.slice(0, 3),
-    'already resolved candidates may make bounded progress');
-  assert.strictEqual(run.ctx.targetMembershipProbesUsed, 3);
+    'the rollback-safe insert capacity still bounds mutation attempts per execution');
   assert.strictEqual(run.ctx.playlistWriteOperationsUsed, 3);
+  assert.deepStrictEqual(run.candidateProbeIds, candidates.slice(0, 4),
+    'membership reads are no longer tied to the write budget; only the capacity stop ends the walk');
+  assert.strictEqual(run.ctx.targetMembershipProbesUsed, 4);
   assert.strictEqual(run.ctx.currentRowStatus.writeErrors, 1,
-    'unprobed candidates must create a blocking retry condition');
+    'the withheld backlog must create a blocking retry condition');
   assert.strictEqual(run.ctx.currentRowStatus.timestampUpdated, false);
   assert.strictEqual(run.timestampWrites, 0,
     'a bounded partial pass must retain the row checkpoint');
+  const summary = run.ctx.__logs.find(line => line.includes('Sequential target progress:'));
+  assert.ok(summary && summary.includes('checked=4') && summary.includes('added=3') &&
+    summary.includes('stoppedEarly=true'));
 }
 
 function testQuotaExhaustedMembershipProbeStopsAndKeepsResolvedCandidates() {
@@ -3509,7 +3527,7 @@ function testQuotaExhaustedMembershipProbeStopsAndKeepsResolvedCandidates() {
   assert.strictEqual(run.timestampWrites, 0);
 }
 
-function testMembershipProbeBudgetIsExecutionWide() {
+function testMembershipReadsAreNoLongerCappedByTheExecutionWriteBudget() {
   const probes = [];
   const inserted = [];
   const ctx = makeContext({
@@ -3548,12 +3566,15 @@ function testMembershipProbeBudgetIsExecutionWide() {
   ctx.addVideosToPlaylist('PL_ONE', ['present-one', 'present-two']);
   ctx.addVideosToPlaylist('PL_TWO', ['fresh-one', 'fresh-two', 'fresh-three']);
 
-  assert.deepStrictEqual(probes, ['present-one', 'present-two', 'fresh-one'],
-    'the three-probe execution budget must not reset for a later row/playlist');
-  assert.deepStrictEqual(inserted, ['fresh-one']);
-  assert.strictEqual(ctx.targetMembershipProbesUsed, 3);
-  assert.strictEqual(ctx.currentRowStatus.writeErrors, 1,
-    'later candidates withheld by the execution-wide ceiling must retain the checkpoint');
+  assert.deepStrictEqual(probes, ['present-one', 'present-two', 'fresh-one', 'fresh-two', 'fresh-three'],
+    'every candidate is resolved in order; reads are never withheld to protect the write budget');
+  assert.deepStrictEqual(inserted, ['fresh-one', 'fresh-two', 'fresh-three'],
+    'writes stay bounded by the rollback-safe capacity, which is large enough for this pair of rows');
+  assert.strictEqual(ctx.targetMembershipProbesUsed, 5);
+  assert.strictEqual(ctx.currentRowStatus.writeErrors, 0,
+    'five membership reads across two rows must not create a blocking read ceiling');
+  assert.ok(!ctx.__logs.some(line => line.includes('probe limit of')),
+    'the execution-wide probe ceiling must be gone from ordinary sequential processing');
 }
 
 function testBlankCheckpointBypassesLongFrequencyAndHonorsSuppression() {
@@ -3672,7 +3693,8 @@ function testMissingOrInvalidInsertResponseIdBlocksAndRequiresManualReview() {
     assert.strictEqual(run.timestampWrites, 0,
       'a likely but untracked insertion must never advance the checkpoint');
     assert.ok(run.ctx.__logs.some(line => line.includes('manual target-playlist review is required')));
-    assert.ok(run.ctx.__logs.some(line => line.includes('Added 0 video(s)') && line.includes('failed 1')),
+    assert.ok(run.ctx.__logs.some(line =>
+      line.includes('Sequential target progress:') && line.includes('added=0') && line.includes('failed=1')),
       'a malformed response must not be reported as a successful add');
   });
 }
@@ -3712,19 +3734,17 @@ function testMissingInsertIdReconciliationQuotaLatchesLaterProbes() {
   assert.ok(run.ctx.targetMembershipQuotaFailure,
     'quota exhaustion during rollback-handle recovery must latch execution-wide');
   const probeCountBeforeLaterRow = run.candidateProbeIds.length + run.reconciliationProbeIds.length;
-  const laterResult = run.ctx.getTargetPendingVideoIds(
+  const laterResult = run.ctx.checkTargetVideoMembership(
     'PL_LATER_TARGET',
-    ['later-row-candidate'],
-    {videoSet: Object.create(null), complete: false, pagesRead: 1},
-    5
+    'later-row-candidate',
+    {videoSet: Object.create(null), complete: false, pagesRead: 1}
   );
   const probeCountAfterLaterRow = run.candidateProbeIds.length + run.reconciliationProbeIds.length;
 
   assert.strictEqual(probeCountAfterLaterRow, probeCountBeforeLaterRow,
     'a latched quota failure must prevent later-row membership requests');
-  assert.deepStrictEqual(Array.from(laterResult.pendingVideoIds), []);
-  assert.strictEqual(laterResult.unresolvedCount, 1);
-  assert.strictEqual(laterResult.quotaExhausted, true);
+  assert.strictEqual(laterResult, 'unknown',
+    'a latched quota failure makes every later membership question undecidable');
   assert.strictEqual(run.ctx.currentRowStatus.timestampUpdated, false);
   assert.strictEqual(run.timestampWrites, 0);
 }
@@ -3878,7 +3898,7 @@ const tests = [
   testPostInsertTransitionIsRolledBack,
   testFirstTargetPageFailureBlocksWithoutProbesOrInserts,
   testPartialTargetReadUsesCandidateProbesAndContinues,
-  testOneMembershipProbeFailureWithholdsOnlyThatCandidate,
+  testUnverifiableMembershipStopsSequentialProgressAndRetainsCheckpoint,
   testMalformedTargetInventoryItemForcesExactMembershipProbe,
   testMalformedTargetMembershipItemsWithholdsCandidate,
   testExactLegacyDuplicateReasonMaySafeSkip,
@@ -3889,9 +3909,9 @@ const tests = [
   testLoggerFailureDuringPostInsertMetadataFailureStillRollsBack,
   testLoggerFailureDuringLaterDuplicateStillPostValidatesEarlierInsert,
   testLoggerOutagePersistsInMemoryRowEvidenceAndKeepsAggregate,
-  testPartialTargetProbeFanoutIsBoundedAndRetainsCheckpoint,
+  testInsertCapacityBoundsWritesWhileMembershipReadsKeepGoing,
   testQuotaExhaustedMembershipProbeStopsAndKeepsResolvedCandidates,
-  testMembershipProbeBudgetIsExecutionWide,
+  testMembershipReadsAreNoLongerCappedByTheExecutionWriteBudget,
   testBlankCheckpointBypassesLongFrequencyAndHonorsSuppression,
   testMissingOrInvalidInsertResponseIdBlocksAndRequiresManualReview,
   testMissingInsertResponseIdReconcilesUniqueItemAndRollsBack,

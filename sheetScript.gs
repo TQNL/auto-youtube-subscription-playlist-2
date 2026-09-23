@@ -1,4 +1,4 @@
-// Bounded hybrid destination deduplication v5.7: 2026-09-12
+// Sequential destination progress v5.8: 2026-09-22
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -14,6 +14,8 @@
 // of remaining daily quota; it is a conservative circuit breaker.
 var maxPlaylistWriteOperationsPerRun = 150;
 var playlistWriteOperationsUsed = 0;
+// Diagnostic count for exact target-membership reads. Ordinary membership checks are no longer
+// capped by the rollback-safe write budget; writes remain bounded separately.
 var targetMembershipProbesUsed = 0;
 var targetMembershipQuotaFailure = null;
 
@@ -376,7 +378,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
 
   var newVideoIds = [];
   for (var channelIndex = 0; channelIndex < channelIds.length; channelIndex++) {
-    var channelVideos = getVideoIdsWithLessQueries(channelIds[channelIndex], lastTimestamp);
+    var channelVideos = getVideoIdsWithLessQueries(channelIds[channelIndex], lastTimestamp, rowCutoffTimestamp);
     if (debugFlag_logWhenNoNewVideosFound && channelVideos.length === 0) {
       safeLog("Channel with id " + channelIds[channelIndex] + " has no new videos");
     }
@@ -384,7 +386,7 @@ function processPlaylistRow(sheet, data, iRow, playlistId) {
   }
 
   for (var playlistIndex = 0; playlistIndex < playlistIds.length; playlistIndex++) {
-    var playlistVideos = getPlaylistVideoIds(playlistIds[playlistIndex], lastTimestamp);
+    var playlistVideos = getPlaylistVideoIds(playlistIds[playlistIndex], lastTimestamp, rowCutoffTimestamp);
     if (debugFlag_logWhenNoNewVideosFound && playlistVideos.length === 0) {
       safeLog("Playlist with id " + playlistIds[playlistIndex] + " has no new videos");
     }
@@ -971,7 +973,7 @@ function getVideoIds(channelId, lastTimestamp) {
 
 // Get videos from a channel's uploads playlist with low quota use.
 
-function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
+function getVideoIdsWithLessQueries(channelId, lastTimestamp, cutoffTimestamp) {
   var videoIds = [];
   var uploadsPlaylistId;
 
@@ -994,6 +996,8 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
   var nextPageToken = null;
   var seenPageTokens = Object.create(null);
   var pagesRead = 0;
+  var checkpoint = new Date(lastTimestamp);
+  var cutoff = cutoffTimestamp ? new Date(cutoffTimestamp) : new Date();
   do {
     try {
       var options = {
@@ -1010,6 +1014,7 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
 
       pagesRead += 1;
       var pageHasUnknownItem = false;
+      var pageHasItemAtOrAfterCheckpoint = false;
       var videosToBeAdded = results.items.filter(function(item) {
         var details = item && item.contentDetails;
         var publishedAt = details && new Date(details.videoPublishedAt);
@@ -1022,15 +1027,19 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
           );
           return false;
         }
-        return new Date(lastTimestamp) <= publishedAt;
+        if (publishedAt >= checkpoint) pageHasItemAtOrAfterCheckpoint = true;
+        // Process only the frozen interval [checkpoint, cutoff]. Anything newer
+        // than cutoff belongs to the next successful row execution.
+        return publishedAt >= checkpoint && publishedAt <= cutoff;
       });
       [].push.apply(videoIds, videosToBeAdded.map(function(item) {
         return item.contentDetails.videoId;
       }));
 
-      // Uploads playlists are newest-first. Once a whole page predates the
-      // checkpoint there is no reason to request older pages.
-      if (results.items.length > 0 && videosToBeAdded.length === 0 && !pageHasUnknownItem) break;
+      // Uploads playlists are newest-first. Only stop when the whole valid page
+      // is older than the checkpoint. A page containing only post-cutoff videos
+      // must NOT stop pagination because older in-window videos may follow.
+      if (results.items.length > 0 && !pageHasItemAtOrAfterCheckpoint && !pageHasUnknownItem) break;
       var returnedToken = results.nextPageToken || null;
       if (returnedToken && seenPageTokens[returnedToken]) {
         recordRowError(
@@ -1057,12 +1066,13 @@ function getVideoIdsWithLessQueries(channelId, lastTimestamp) {
 
 // Get video IDs from an explicit source playlist.
 
-function getPlaylistVideoIds(playlistId, lastTimestamp) {
+function getPlaylistVideoIds(playlistId, lastTimestamp, cutoffTimestamp) {
   var videoIds = [];
   var nextPageToken = null;
   var seenPageTokens = Object.create(null);
   var pagesRead = 0;
   var checkpoint = new Date(lastTimestamp);
+  var cutoff = cutoffTimestamp ? new Date(cutoffTimestamp) : new Date();
 
   // playlistItems.list has no order or publishedAfter parameters. Explicit
   // playlists can also be manually ordered, so every page must be fetched and
@@ -1094,7 +1104,7 @@ function getPlaylistVideoIds(playlistId, lastTimestamp) {
           );
           return;
         }
-        if (publishedAt >= checkpoint) videoIds.push(videoId);
+        if (publishedAt >= checkpoint && publishedAt <= cutoff) videoIds.push(videoId);
       });
       var returnedToken = results.nextPageToken || null;
       if (returnedToken && seenPageTokens[returnedToken]) {
@@ -1236,114 +1246,65 @@ function getTargetPlaylistVideoInventory(playlistId) {
   return inventory;
 }
 
-// Resolve membership without relying on a complete target scan. playlistItems
-// supports playlistId + videoId, which remains precise even when a deep page
-// token fails. Exact probes are capped by the rollback-safe insert capacity so
-// a pagination failure cannot turn a bounded mutation into an unbounded read
-// fan-out. Any unresolved candidate keeps the row checkpoint for retry.
-function getTargetPendingVideoIds(playlistId, videoIds, inventory, maxMembershipProbes) {
-  var pendingVideoIds = [];
-  var alreadyPresentCount = 0;
-  var unresolvedCount = 0;
-  var membershipProbesUsed = 0;
-  var deferredByProbeLimit = 0;
-  var deferredAfterQuota = 0;
-  var quotaFailure = targetMembershipQuotaFailure;
-  var probeLimit = typeof maxMembershipProbes === "number"
-    ? Math.max(0, Math.floor(maxMembershipProbes))
-    : videoIds.length;
+// Resolve one candidate against the destination. The two-page inventory above is
+// only a cheap cache: when it is incomplete, every cache miss is checked exactly
+// with playlistId + videoId. Reads are not capped by the write budget.
+//
+// Returns "present", "absent", or "unknown". "unknown" is always blocking so
+// the row checkpoint is retained and the same frozen interval is retried.
+function checkTargetVideoMembership(playlistId, videoId, inventory) {
+  if (lookupSetHas(inventory.videoSet, videoId)) return "present";
+  if (inventory.complete) return "absent";
 
-  videoIds.forEach(function(videoId) {
-    if (lookupSetHas(inventory.videoSet, videoId)) {
-      alreadyPresentCount += 1;
-      return;
-    }
-
-    if (!inventory.complete) {
-      if (quotaFailure) {
-        unresolvedCount += 1;
-        deferredAfterQuota += 1;
-        return;
-      }
-      if (membershipProbesUsed >= probeLimit) {
-        unresolvedCount += 1;
-        deferredByProbeLimit += 1;
-        return;
-      }
-
-      membershipProbesUsed += 1;
-      targetMembershipProbesUsed += 1;
-      try {
-        var membership = YouTube.PlaylistItems.list('id', {
-          playlistId: playlistId,
-          videoId: videoId,
-          maxResults: 1,
-          fields: 'items(id)'
-        });
-        if (!membership || !Array.isArray(membership.items)) {
-          unresolvedCount += 1;
-          recordRowError(
-            "write",
-            "Target membership check returned an invalid response for video " + videoId + "; withholding it for retry"
-          );
-          return;
-        }
-        if (membership.items.length > 0 && !membership.items.some(function(item) { return item && item.id; })) {
-          unresolvedCount += 1;
-          recordRowError(
-            "write",
-            "Target membership check returned an item without an ID for video " + videoId + "; withholding it for retry"
-          );
-          return;
-        }
-        if (membership.items.length > 0) {
-          inventory.videoSet[videoId] = true;
-          alreadyPresentCount += 1;
-          return;
-        }
-      } catch (e) {
-        unresolvedCount += 1;
-        if (isQuotaExhaustionError(e)) {
-          quotaFailure = e;
-          targetMembershipQuotaFailure = e;
-          deferredAfterQuota += 1;
-        } else {
-          recordRowError(
-            "write",
-            "Cannot verify whether video " + videoId + " is already in target playlist " +
-            playlistId + "; withholding it for retry: " + describeError(e)
-          );
-        }
-        return;
-      }
-    }
-
-    pendingVideoIds.push(videoId);
-  });
-
-  if (quotaFailure && deferredAfterQuota > 0) {
+  if (targetMembershipQuotaFailure) {
     recordRowError(
       "write",
-      "Target membership probes stopped after quota exhaustion; " + deferredAfterQuota +
-      " unresolved candidate(s) were withheld, already resolved candidates were retained, and the checkpoint will be retried: " +
-      describeError(quotaFailure)
+      "Cannot verify whether video " + videoId + " is already in target playlist " + playlistId +
+      " because target-membership reads previously exhausted quota; withholding it for retry: " +
+      describeError(targetMembershipQuotaFailure)
     );
-  }
-  if (deferredByProbeLimit > 0) {
-    recordRowError(
-      "write",
-      "Target membership probe limit of " + probeLimit + " was reached; " + deferredByProbeLimit +
-      " unresolved candidate(s) were withheld and the checkpoint will be retried"
-    );
+    return "unknown";
   }
 
-  return {
-    pendingVideoIds: pendingVideoIds,
-    alreadyPresentCount: alreadyPresentCount,
-    unresolvedCount: unresolvedCount,
-    membershipProbesUsed: membershipProbesUsed,
-    quotaExhausted: !!quotaFailure
-  };
+  targetMembershipProbesUsed += 1;
+  try {
+    var membership = YouTube.PlaylistItems.list('id', {
+      playlistId: playlistId,
+      videoId: videoId,
+      maxResults: 1,
+      fields: 'items(id)'
+    });
+
+    if (!membership || !Array.isArray(membership.items)) {
+      recordRowError(
+        "write",
+        "Target membership check returned an invalid response for video " + videoId +
+        "; withholding it for retry"
+      );
+      return "unknown";
+    }
+    if (membership.items.length > 0 && !membership.items.some(function(item) { return item && item.id; })) {
+      recordRowError(
+        "write",
+        "Target membership check returned an item without an ID for video " + videoId +
+        "; withholding it for retry"
+      );
+      return "unknown";
+    }
+    if (membership.items.length > 0) {
+      inventory.videoSet[videoId] = true;
+      return "present";
+    }
+    return "absent";
+  } catch (e) {
+    if (isQuotaExhaustionError(e)) targetMembershipQuotaFailure = e;
+    recordRowError(
+      "write",
+      "Cannot verify whether video " + videoId + " is already in target playlist " +
+      playlistId + "; withholding it for retry: " + describeError(e)
+    );
+    return "unknown";
+  }
 }
 
 // Non-mutating target audit. Factual broadcast classification stays separate
@@ -1681,10 +1642,19 @@ function postValidateInsertedItems(records, existingVideos) {
   }
 }
 
-// Add videos using an execution-wide mutation budget. At most half of the
-// remaining operations are used for insert attempts so every success retains a
-// reserved rollback operation. Oversized rows make bounded progress and retain
-// their checkpoint; retries de-duplicate the already completed insertions.
+// Process candidates sequentially against the destination. The row timestamp is
+// still all-or-nothing: it advances only after every candidate in the frozen
+// [checkpoint, cutoff] interval has been dealt with.
+//
+// For each candidate:
+//   1. prove whether it is already in the destination;
+//   2. if present, move on;
+//   3. if absent, revalidate policy and add it;
+//   4. if membership cannot be determined, insertion fails, or the safe write
+//      capacity is reached, stop and retain the row checkpoint.
+//
+// On the next execution, videos successfully added on earlier attempts are now
+// detected as present, so retries naturally move forward through large backlogs.
 function addVideosToPlaylist(playlistId, videoIds) {
   if (!videoIds.length) {
     safeLog("No new videos yet.");
@@ -1692,75 +1662,73 @@ function addVideosToPlaylist(playlistId, videoIds) {
   }
 
   var remainingOperations = maxPlaylistWriteOperationsPerRun - playlistWriteOperationsUsed;
+  // At most half of the currently available mutation operations may be insert
+  // attempts. The other half remains available for post-insert rollback.
   var safeInsertCapacity = Math.floor(Math.max(0, remainingOperations) / 2);
 
   var targetInventory = getTargetPlaylistVideoInventory(playlistId);
   if (targetInventory === null) return;
 
-  // Bound exact fallback reads across the whole execution, not just this row.
-  // Tying the probe budget to the configured rollback-safe write ceiling keeps
-  // a series of partial target scans from multiplying quota consumption.
-  var maxMembershipProbesPerRun = Math.floor(Math.max(0, maxPlaylistWriteOperationsPerRun) / 2);
-  var remainingMembershipProbeBudget = Math.max(
-    0,
-    maxMembershipProbesPerRun - targetMembershipProbesUsed
-  );
-
-  var membershipResult = getTargetPendingVideoIds(
-    playlistId,
-    videoIds,
-    targetInventory,
-    Math.min(safeInsertCapacity, remainingMembershipProbeBudget)
-  );
-  safeLog("Target deduplication: inventory pages=" + targetInventory.pagesRead +
-    ", complete=" + targetInventory.complete +
-    ", exact checks=" + membershipResult.membershipProbesUsed +
-    ", present=" + membershipResult.alreadyPresentCount +
-    ", absent=" + membershipResult.pendingVideoIds.length +
-    ", unresolved=" + membershipResult.unresolvedCount + ".");
   var existingVideos = targetInventory.videoSet;
-  var pendingVideoIds = membershipResult.pendingVideoIds;
-  var alreadyPresentCount = membershipResult.alreadyPresentCount;
-  videoIds.forEach(function(videoId) {
-    if (existingVideos[videoId]) finishVideoRetry(videoId, "RESOLVED", "Already present in target playlist");
-  });
-  if (alreadyPresentCount > 0) {
-    safeLog("Skipped " + alreadyPresentCount + " video(s) already present in the target playlist.");
-  }
-  if (!pendingVideoIds.length) {
-    safeLog("No new videos to insert after target-playlist de-duplication.");
-    return;
-  }
-
-  if (safeInsertCapacity == 0) {
-    recordRowError(
-      "write",
-      "No safe insert capacity remains after reserving rollback operations; " + pendingVideoIds.length + " video(s) deferred"
-    );
-    return;
-  }
-
-  if (pendingVideoIds.length > safeInsertCapacity) {
-    recordRowError(
-      "write",
-      "Write safety capacity permits " + safeInsertCapacity + " of " + pendingVideoIds.length +
-      " candidate video(s); validating and inserting that bounded subset while retaining the checkpoint for retry"
-    );
-    pendingVideoIds = pendingVideoIds.slice(0, safeInsertCapacity);
-  }
-
-  pendingVideoIds = revalidateStrictCandidates(pendingVideoIds, "pre-insert admission revalidation");
-  if (!pendingVideoIds.length) {
-    safeLog("No eligible videos remain after pre-insert admission revalidation.");
-    return;
-  }
-
+  var checkedCount = 0;
+  var alreadyPresentCount = 0;
+  var insertionAttemptCount = 0;
   var successCount = 0;
   var skippedCount = 0;
   var errorCount = 0;
+  var policyRejectedCount = 0;
   var insertedRecords = [];
-  for (var i = 0; i < pendingVideoIds.length; i++) {
-    var videoId = pendingVideoIds[i];
+  var stoppedEarly = false;
+
+  for (var i = 0; i < videoIds.length; i++) {
+    var videoId = videoIds[i];
+    var membership = checkTargetVideoMembership(playlistId, videoId, targetInventory);
+    checkedCount += 1;
+
+    if (membership === "unknown") {
+      errorCount += 1;
+      stoppedEarly = true;
+      break;
+    }
+
+    if (membership === "present") {
+      alreadyPresentCount += 1;
+      finishVideoRetry(videoId, "RESOLVED", "Already present in target playlist");
+      continue;
+    }
+
+    // The candidate is definitely absent. Do not spend another write once the
+    // rollback-safe insertion-attempt capacity has been reached. Stop here so
+    // the checkpoint remains old; the next execution will skip prior successes
+    // as already present and continue from this backlog naturally.
+    if (insertionAttemptCount >= safeInsertCapacity) {
+      recordRowError(
+        "write",
+        "Write safety capacity of " + safeInsertCapacity + " insertion attempt(s) was reached after " +
+        i + " candidate(s); stopped before video " + videoId +
+        ". The checkpoint was retained so the next execution can skip completed videos and continue."
+      );
+      stoppedEarly = true;
+      break;
+    }
+
+    // Preserve the strict admission policy immediately before each insertion.
+    // A blocking metadata failure stops this row. A permanent policy rejection
+    // is a completed decision and can safely move on to the next candidate.
+    var errorsBeforeRevalidation = currentRowStatus ? currentRowStatus.errorCount : 0;
+    var eligibleIds = revalidateStrictCandidates([videoId], "pre-insert admission revalidation");
+    var errorsAfterRevalidation = currentRowStatus ? currentRowStatus.errorCount : errorsBeforeRevalidation;
+    if (errorsAfterRevalidation > errorsBeforeRevalidation) {
+      errorCount += errorsAfterRevalidation - errorsBeforeRevalidation;
+      stoppedEarly = true;
+      break;
+    }
+    if (!eligibleIds.length) {
+      policyRejectedCount += 1;
+      continue;
+    }
+
+    insertionAttemptCount += 1;
     playlistWriteOperationsUsed += 1;
     try {
       var insertedResource = YouTube.PlaylistItems.insert({
@@ -1772,11 +1740,11 @@ function addVideosToPlaylist(playlistId, videoIds) {
       var playlistItemId = insertedResource && typeof insertedResource.id === "string"
         ? insertedResource.id.trim()
         : "";
+
       if (!playlistItemId) {
         // The mutation may have succeeded, but without its playlist-item ID it
         // cannot be post-validated with a guaranteed rollback. Remember likely
-        // membership for this execution, stop further writes, and force a retry
-        // plus manual review instead of reporting unsafe success.
+        // membership, attempt exact reconciliation, then stop and retry the row.
         existingVideos[videoId] = true;
         errorCount += 1;
         recordRowError(
@@ -1788,41 +1756,61 @@ function addVideosToPlaylist(playlistId, videoIds) {
         if (!reconcileInsertWithoutResponseId(playlistId, videoId, existingVideos)) {
           postValidateInsertWithoutRollbackHandle(videoId);
         }
+        stoppedEarly = true;
         break;
       }
+
       existingVideos[videoId] = true;
-      insertedRecords.push({
-        videoId: videoId,
-        playlistItemId: playlistItemId
-      });
+      insertedRecords.push({videoId: videoId, playlistItemId: playlistItemId});
       successCount += 1;
     } catch (e) {
       var reason = getErrorReason(e);
       if (reason === "videoAlreadyInPlaylist") {
+        // A race can make the exact pre-check stale. This outcome is still a
+        // successful resolution of the candidate, so continue.
         existingVideos[videoId] = true;
+        alreadyPresentCount += 1;
         skippedCount += 1;
         safeLog("Skipped video already present in playlist: " + videoId);
         finishVideoRetry(videoId, "RESOLVED", "Insert API confirmed already present");
-      } else if (reason === "videoNotFound") {
-        errorCount += 1;
+        continue;
+      }
+
+      errorCount += 1;
+      if (reason === "videoNotFound") {
         recordRetryableVideoFailure(
           videoId, "write",
           "Video " + videoId + " disappeared between validation and insertion; withholding it for retry: " + describeError(e)
         );
       } else if (reason === "playlistOperationUnsupported") {
-        errorCount += 1;
-        recordRowError("write", "The target is a playlist that the API cannot modify (for example Watch Later or Watch History): " + playlistId);
-        break;
+        recordRowError(
+          "write",
+          "The target is a playlist that the API cannot modify (for example Watch Later or Watch History): " + playlistId
+        );
       } else {
-        errorCount += 1;
         if (isQuotaExhaustionError(e)) targetMembershipQuotaFailure = e;
-        recordRowError("write", "Could not insert video " + videoId + " into playlist " + playlistId + ": " + describeError(e));
+        recordRowError(
+          "write",
+          "Could not insert video " + videoId + " into playlist " + playlistId + ": " + describeError(e)
+        );
       }
+      stoppedEarly = true;
+      break;
     }
   }
 
   if (insertedRecords.length > 0) postValidateInsertedItems(insertedRecords, existingVideos);
-  safeLog("Added " + successCount + " video(s); skipped " + skippedCount + "; failed " + errorCount + ".");
+
+  safeLog(
+    "Sequential target progress: checked=" + checkedCount +
+    ", present=" + alreadyPresentCount +
+    ", insert attempts=" + insertionAttemptCount +
+    ", added=" + successCount +
+    ", insert-race skips=" + skippedCount +
+    ", policy rejected/deferred=" + policyRejectedCount +
+    ", failed=" + errorCount +
+    ", stoppedEarly=" + stoppedEarly + "."
+  );
 }
 
 // Delete old and duplicate items only after all pages have been read. Mutating

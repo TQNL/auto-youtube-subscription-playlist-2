@@ -3,6 +3,42 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
+## V5.8 sequential destination progress
+
+- Candidates are now resolved one at a time against the destination. Each one is
+  first proven present or absent — by the two-page inventory when it covers the
+  candidate, otherwise by an exact `playlistItems.list(playlistId, videoId)`
+  read — and only a proven-absent candidate is revalidated and inserted.
+- The membership-probe ceiling that tied read-only checks to the rollback-safe
+  write budget is removed. Writes remain bounded by
+  `maxPlaylistWriteOperationsPerRun`, with half the remaining operations still
+  reserved for rollback. This removes the previous failure mode in which a large
+  backlog was rediscovered on every retry and stopped after a fixed number of
+  exact checks with `Target membership probe limit of N was reached`.
+- An undecidable membership result, a blocking pre-insert revalidation failure, a
+  failed insertion, or exhausted insert capacity stops the walk at that candidate
+  and retains the row checkpoint. Everything resolved earlier in the same pass is
+  kept and is recognised as already present on the next execution, so repeated
+  runs move monotonically farther through the same backlog.
+- Pre-insert admission revalidation now runs per candidate instead of once per
+  row batch. The strict policy is unchanged, but each inserted candidate costs its
+  own `videos.list` call, so a large backlog spends more read quota per
+  execution than V5.7 did.
+- Source discovery is frozen to the `[checkpoint, cutoff]` interval: uploads and
+  explicit-playlist reads now receive the row cutoff, and pagination no longer
+  stops on a page that merely added no in-window videos. A newest-first page
+  containing only post-cutoff videos is skipped rather than treated as the end of
+  the interval.
+- Replaces the per-row `Added N video(s); skipped N; failed N.` line with one
+  `Sequential target progress: checked=…, present=…, insert attempts=…, added=…,
+  insert-race skips=…, policy rejected/deferred=…, failed=…, stoppedEarly=…`
+  summary.
+- Adds five deterministic sequential-progress tests and rewrites the hybrid
+  deduplication tests against the new membership API (116 tests across five
+  suites). See `docs/SEQUENTIAL_PROGRESS.md`.
+- Not yet live-validated: the source snapshot and this entry describe the
+  algorithm and its unit-tested bounds, not a production result.
+
 ## V5.7 bounded hybrid destination deduplication
 
 - Destination inventory reads stop after two pages (100 entries). A capped
