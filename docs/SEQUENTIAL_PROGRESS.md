@@ -1,8 +1,9 @@
 # V5.8 sequential destination progress
 
-Status: **unvalidated source snapshot.** This document records the algorithm and
-its deterministic test coverage. It is not a production result; the live
-validation of the row-8 backlog is still outstanding.
+Status: **live-validated on 2026-09-23** against the row whose checkpoint had been
+stuck since 2026-09-07. This document records the algorithm and its deterministic
+test coverage; the production run evidence is in
+[`LIVE_VALIDATION_2026-09-23_V5.8.md`](./LIVE_VALIDATION_2026-09-23_V5.8.md).
 
 Immutable source: [`versions/v5.8-sequential-progress.gs`](../versions/v5.8-sequential-progress.gs).
 
@@ -72,9 +73,10 @@ up containing each video exactly once.
 
 - **The cutoff is re-frozen, not persisted.** Each execution freezes its own
   cutoff, so videos published between executions join the interval. Convergence
-  relies on previously inserted videos being recognised as present, which is the
-  property the tests above assert. Whether new arrivals can indefinitely extend
-  the workload in production is not yet observed.
+  relies on previously inserted videos being recognised as present. The
+  2026-09-23 validation showed that property holding in production (`present`
+  131 → 204 after a run that added 73 videos), but it does not bound the case
+  where new source videos keep arriving during every retry window.
 - **One extra read per run.** Membership is proved before the capacity check, so
   the candidate that trips the capacity stop has already been read. This is one
   additional quota unit per destination per execution.
@@ -91,8 +93,8 @@ up containing each video exactly once.
   intentional schema marker (the value is only logged, never validated).
   `versions/v5.8-sequential-progress.gs` and `sheetScript.gs` were committed
   exactly as delivered, with line endings normalized to LF and nothing else
-  changed, so the snapshot still matches the code under test. The marker should be
-  corrected in the next revision, after the current live validation finishes.
+  changed, so the snapshot still matches the code that was live-validated on
+  2026-09-23. The marker should be corrected in the next revision.
 
 ## Test coverage
 

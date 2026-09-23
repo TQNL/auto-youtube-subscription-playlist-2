@@ -36,8 +36,14 @@ snapshots live in `versions/`, and promoted revisions receive signed-off Git tag
 - Adds five deterministic sequential-progress tests and rewrites the hybrid
   deduplication tests against the new membership API (116 tests across five
   suites). See `docs/SEQUENTIAL_PROGRESS.md`.
-- Not yet live-validated: the source snapshot and this entry describe the
-  algorithm and its unit-tested bounds, not a production result.
+- Live-validated on 2026-09-23 against the stuck row. Run 1 exhausted the
+  rollback-safe insert capacity (`checked=205, present=131, added=73,
+  stoppedEarly=true`) and retained the checkpoint; Run 2 resolved the interval
+  (`checked=239, present=204, added=35, stoppedEarly=false`) with no error and
+  advanced the checkpoint for the first time since 2026-09-07; Run 3 found
+  nothing new and advanced it again. The destination grew 515 → 588 → 623, exactly
+  the reported insertions. The retired probe-limit error did not appear. See the
+  [validation record](./docs/LIVE_VALIDATION_2026-09-23_V5.8.md).
 
 ## V5.7 bounded hybrid destination deduplication
 
