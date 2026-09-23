@@ -2,11 +2,12 @@
 This is a Google Apps Script that automatically adds new Youtube videos to playlists (a replacement for Youtube Collections feature).
 
 > **TQNL reliability fork:** development in this fork is strict and evidence-led.
-> The current `sheetScript.gs` candidate is V5.5 strict broadcast rejection.
-> Immutable earlier revisions, including the retired 90-minute Premiere
-> experiment, remain in [`versions/`](./versions). The active invariant is
-> documented in [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md); historical
-> experiment evidence remains in
+> The current `sheetScript.gs` candidate is V5.8 sequential destination progress,
+> built on the V5.5 strict broadcast rejection policy. Immutable earlier
+> revisions, including the retired 90-minute Premiere experiment, remain in
+> [`versions/`](./versions). The active invariant is documented in
+> [`docs/STRICT_POLICY.md`](./docs/STRICT_POLICY.md); historical experiment
+> evidence remains in
 > [`docs/PREMIERE_90M_EXPERIMENT.md`](./docs/PREMIERE_90M_EXPERIMENT.md).
 
 V5.5 allows only videos whose documented broadcast state is `none` and whose
