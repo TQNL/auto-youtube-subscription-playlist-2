@@ -3,6 +3,13 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
+## V5.8.1 retry-cap tail safety
+
+- Continue processing remaining candidates when insertion `videoNotFound` is durably deferred for 100 hours or abandoned after its final attempt.
+- Guard checkpoint advancement whenever sequential processing stops without a recorded blocking error.
+- Add regression coverage for fourth-failure deferral and final abandonment with healthy tail candidates, plus ordinary pre-cap failures. All 118 tests pass.
+- Admission filters, retry timing, mutation budgets and project configuration are unchanged.
+
 ## V5.8 sequential destination progress
 
 - Candidates are now resolved one at a time against the destination. Each one is
@@ -197,4 +204,3 @@ for the independent short-video rule.
   the current checkpoint and requests manual review when immediate exact
   reconciliation cannot identify one rollback handle, but that condition is not
   yet persisted across executions.
-

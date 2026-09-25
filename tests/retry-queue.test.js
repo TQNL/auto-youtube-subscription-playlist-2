@@ -94,6 +94,40 @@ function waitEntry(f, id = 'missing') {
 }
 
 const tests = {
+  insertionRetryCapProcessesHealthyTailBeforeAdvancing() {
+    for (const finalAttempt of [false, true]) {
+      const f = fixture();
+      if (finalAttempt) {
+        const entry = waitEntry(f); f.state.now = entry.due;
+      } else {
+        for (let n = 0; n < 3; n++) {
+          f.state.reset(); f.ctx.recordRetryableVideoFailure('missing', 'write', 'previous failure');
+        }
+      }
+      f.state.discovered = ['missing', 'healthy', 'healthy2'];
+      f.ctx.YouTube.PlaylistItems.insert = resource => {
+        const id = resource.snippet.resourceId.videoId;
+        if (id === 'missing') {
+          const error = Error('video not found');
+          error.details = {errors: [{reason: 'videoNotFound'}]}; throw error;
+        }
+        f.state.inserts.push(id); return {id: 'item-' + id};
+      };
+      f.state.run();
+      assert.strictEqual(f.state.entry('missing').status, finalAttempt ? 'ABANDONED' : 'WAITING_100H');
+      assert.deepStrictEqual(f.state.inserts, ['healthy', 'healthy2']);
+      assert.strictEqual(f.ctx.currentRowStatus.errorCount, 0);
+      assert.strictEqual(f.ctx.currentRowStatus.timestampUpdated, true);
+    }
+  },
+  insertionFailureBeforeRetryCapStillRetainsCheckpoint() {
+    const f = fixture();
+    f.state.insertError = Object.assign(Error('video not found'), {details: {errors: [{reason: 'videoNotFound'}]}});
+    f.state.run();
+    assert.strictEqual(f.state.entry('missing').status, 'RETRYING');
+    assert.strictEqual(f.ctx.currentRowStatus.timestampUpdated, false);
+    assert.deepStrictEqual(f.state.inserts, []);
+  },
   fourFailuresReleaseCheckpointAndPreserveHealthyCandidates() {
     const f = fixture(); f.state.metadata = ids => ids.filter(id => id !== 'missing').map(id => normal(id));
     for (let attempt = 1; attempt <= 4; attempt++) {

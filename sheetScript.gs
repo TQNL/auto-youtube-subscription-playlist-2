@@ -1,4 +1,4 @@
-// Sequential destination progress v5.8: 2026-09-22
+// Sequential destination progress v5.8.1: 2026-09-25
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)
@@ -1778,10 +1778,22 @@ function addVideosToPlaylist(playlistId, videoIds) {
 
       errorCount += 1;
       if (reason === "videoNotFound") {
+        var errorsBeforeRetry = currentRowStatus ? currentRowStatus.errorCount : 0;
         recordRetryableVideoFailure(
           videoId, "write",
           "Video " + videoId + " disappeared between validation and insertion; withholding it for retry: " + describeError(e)
         );
+        var savedRetry = videoRetryStore && currentRetryPlaylistId &&
+          videoRetryStore.entries[videoRetryKey(currentRetryPlaylistId, videoId)];
+        // A durable deferral/abandonment resolves this candidate, not the rest
+        // of the interval. Continue instead of advancing past an unvisited tail.
+        if (savedRetry && (savedRetry.status === "WAITING_100H" || savedRetry.status === "ABANDONED") &&
+            currentRowStatus && currentRowStatus.errorCount === errorsBeforeRetry) {
+          policyRejectedCount += 1;
+          safeLog("Insertion retry for video " + videoId + " saved as " + savedRetry.status +
+            "; continuing remaining candidates before checkpoint advancement.");
+          continue;
+        }
       } else if (reason === "playlistOperationUnsupported") {
         recordRowError(
           "write",
@@ -1800,6 +1812,11 @@ function addVideosToPlaylist(playlistId, videoIds) {
   }
 
   if (insertedRecords.length > 0) postValidateInsertedItems(insertedRecords, existingVideos);
+
+  // A future early-stop path must never silently release unvisited candidates.
+  if (stoppedEarly && currentRowStatus && currentRowStatus.errorCount === 0) {
+    recordRowError("write", "Sequential processing stopped before completing the candidate interval; checkpoint retained.");
+  }
 
   safeLog(
     "Sequential target progress: checked=" + checkedCount +
