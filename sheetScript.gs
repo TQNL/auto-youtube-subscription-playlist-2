@@ -1,4 +1,4 @@
-// Sequential destination progress v5.8.1: 2026-09-25
+// Sequential destination progress v5.9: 2026-09-25
 // Source/read, filter, insertion, and maintenance failures are isolated per row.
 // First-page permanently missing sources and independent cleanup failures are non-blocking warnings.
 // Auto Youtube Subscription Playlist (2)

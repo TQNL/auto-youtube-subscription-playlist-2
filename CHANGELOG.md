@@ -3,7 +3,7 @@
 The active production candidate is always `sheetScript.gs`. Immutable historical
 snapshots live in `versions/`, and promoted revisions receive signed-off Git tags.
 
-## V5.8.1 retry-cap tail safety
+## V5.9 retry-cap tail safety
 
 - Continue processing remaining candidates when insertion `videoNotFound` is durably deferred for 100 hours or abandoned after its final attempt.
 - Guard checkpoint advancement whenever sequential processing stops without a recorded blocking error.
